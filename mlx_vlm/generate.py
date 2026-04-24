@@ -16,6 +16,11 @@ from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
 
+try:
+    from mlx_lm.generate import rewind_prompt_cache as mlx_rewind_prompt_cache
+except ImportError:
+    mlx_rewind_prompt_cache = None
+
 from .models import cache
 from .prompt_utils import apply_chat_template
 from .turboquant import TurboQuantKVCache, turboquant_enabled
@@ -371,6 +376,52 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
+def _recover_text_only_prompt_cache(
+    prompt_cache_state: PromptCacheState, prefix_len: int
+) -> Optional[List[Any]]:
+    if prompt_cache_state.cache is None or prompt_cache_state.token_ids is None:
+        return None
+    if mlx_rewind_prompt_cache is None:
+        return _trim_dense_text_only_prompt_cache(prompt_cache_state, prefix_len)
+
+    num_to_trim = len(prompt_cache_state.token_ids) - prefix_len
+    if num_to_trim <= 0:
+        return prompt_cache_state.cache
+
+    prompt_cache = prompt_cache_state.cache
+    if not mlx_rewind_prompt_cache(prompt_cache, num_to_trim):
+        return None
+    return prompt_cache
+
+
+def _trim_dense_text_only_prompt_cache(
+    prompt_cache_state: PromptCacheState, prefix_len: int
+) -> Optional[List[Any]]:
+    prompt_cache = prompt_cache_state.cache
+    if prompt_cache is None:
+        return None
+
+    dense_layers = []
+    for layer_cache in prompt_cache:
+        if not (
+            hasattr(layer_cache, "keys")
+            and hasattr(layer_cache, "values")
+            and layer_cache.keys is not None
+            and layer_cache.values is not None
+        ):
+            return None
+        if layer_cache.keys.shape[2] < prefix_len:
+            return None
+        dense_layers.append(layer_cache)
+
+    for layer_cache in dense_layers:
+        layer_cache.keys = layer_cache.keys[:, :, :prefix_len, :]
+        layer_cache.values = layer_cache.values[:, :, :prefix_len, :]
+        if hasattr(layer_cache, "offset"):
+            layer_cache.offset = prefix_len
+    return prompt_cache
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -667,34 +718,51 @@ def stream_generate(
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
+    image_token_id = getattr(model.config, "image_token_id", None) or getattr(
+        model.config, "image_token_index", None
+    )
+    text_only_prompt = (
+        image is None
+        and audio is None
+        and pixel_values is None
+        and (image_token_id is None or image_token_id not in full_input_ids_list)
+    )
 
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            reused_prefix_len = prefix_len
-            # Trim to only new tokens
-            input_ids = input_ids[:, prefix_len:]
-            # Only skip vision if no image tokens in the new (trimmed) tokens
-            image_token_id = getattr(model.config, "image_token_id", None) or getattr(
-                model.config, "image_token_index", None
-            )
-            new_ids = input_ids.flatten().tolist()
-            has_image_in_new = image_token_id is not None and image_token_id in new_ids
-            if not has_image_in_new:
-                pixel_values = None
-                kwargs.pop("cached_image_features", None)
-            # Reuse the saved KV cache (trimmed to prefix length)
-            kv_cache = prompt_cache_state.cache
-            # Trim cache to prefix_len in case it includes generated tokens
-            for c in kv_cache:
-                if hasattr(c, "keys") and c.keys is not None:
-                    cached_len = c.keys.shape[2]
-                    if cached_len > prefix_len:
-                        c.keys = c.keys[:, :, :prefix_len, :]
-                        c.values = c.values[:, :, :prefix_len, :]
-                        if hasattr(c, "offset"):
-                            c.offset = prefix_len
-            kwargs["prompt_cache"] = kv_cache
+            if text_only_prompt:
+                recovered_cache = _recover_text_only_prompt_cache(
+                    prompt_cache_state, prefix_len
+                )
+                if recovered_cache is not None:
+                    reused_prefix_len = prefix_len
+                    input_ids = input_ids[:, prefix_len:]
+                    kwargs["prompt_cache"] = recovered_cache
+            else:
+                reused_prefix_len = prefix_len
+                # Trim to only new tokens
+                input_ids = input_ids[:, prefix_len:]
+                # Only skip vision if no image tokens in the new (trimmed) tokens
+                new_ids = input_ids.flatten().tolist()
+                has_image_in_new = (
+                    image_token_id is not None and image_token_id in new_ids
+                )
+                if not has_image_in_new:
+                    pixel_values = None
+                    kwargs.pop("cached_image_features", None)
+                # Reuse the saved KV cache (trimmed to prefix length)
+                kv_cache = prompt_cache_state.cache
+                # Trim cache to prefix_len in case it includes generated tokens
+                for c in kv_cache:
+                    if hasattr(c, "keys") and c.keys is not None:
+                        cached_len = c.keys.shape[2]
+                        if cached_len > prefix_len:
+                            c.keys = c.keys[:, :, :prefix_len, :]
+                            c.values = c.values[:, :, :prefix_len, :]
+                            if hasattr(c, "offset"):
+                                c.offset = prefix_len
+                kwargs["prompt_cache"] = kv_cache
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(

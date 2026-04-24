@@ -1,5 +1,6 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
+import contextlib
 import sys
 from argparse import Namespace
 from types import SimpleNamespace
@@ -15,8 +16,10 @@ from mlx_vlm.generate import (
     BatchResponse,
     BatchStats,
     GenerationResult,
+    PromptCacheState,
     _left_pad_prompts,
     normalize_resize_shape,
+    stream_generate,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
 
@@ -1028,6 +1031,134 @@ class TestSamplerArgs:
             top_k=32,
         )
         mock_make_logits_processors.assert_called_once_with({3: -0.75}, 1.15, 20)
+
+
+def test_stream_generate_qwen3_5_text_only_rewinds_mixed_cache_with_shared_contract():
+    class RewindOnlyLayer:
+        def __init__(self, offset):
+            self.offset = offset
+            self.rewind_calls = []
+
+        def can_rewind(self, n):
+            return n <= self.offset
+
+        def rewind(self, n):
+            self.rewind_calls.append(n)
+            if not self.can_rewind(n):
+                return False
+            self.offset -= n
+            return True
+
+    class DenseRewindLayer(RewindOnlyLayer):
+        def __init__(self, offset):
+            super().__init__(offset)
+            self.keys = mx.zeros((1, 1, offset, 1))
+            self.values = mx.zeros((1, 1, offset, 1))
+
+        def rewind(self, n):
+            if not super().rewind(n):
+                return False
+            self.keys = self.keys[:, :, : self.offset, :]
+            self.values = self.values[:, :, : self.offset, :]
+            return True
+
+    model = MockModel()
+    model.config.model_type = "qwen3_5"
+    processor = MockProcessor()
+    prompt_cache_state = PromptCacheState()
+
+    linear_cache = RewindOnlyLayer(offset=5)
+    attention_cache = DenseRewindLayer(offset=5)
+    prompt_cache_state.token_ids = [11, 12, 13, 14, 15]
+    prompt_cache_state.cache = [linear_cache, attention_cache]
+
+    seen = {}
+
+    def fake_generate_step(input_ids, model, pixel_values, mask, **kwargs):
+        seen["input_ids"] = input_ids.tolist()
+        seen["prompt_cache"] = kwargs["prompt_cache"]
+        yield 2, [0.0]
+
+    with (
+        patch.object(generate_module, "generate_step", side_effect=fake_generate_step),
+        patch.object(
+            generate_module,
+            "wired_limit",
+            side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+        ),
+        patch.object(generate_module.mx, "clear_cache"),
+    ):
+        list(
+            stream_generate(
+                model,
+                processor,
+                prompt="ignored",
+                input_ids=mx.array([[11, 12, 13, 99]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache_state=prompt_cache_state,
+            )
+        )
+
+    assert seen["input_ids"] == [[99]]
+    assert seen["prompt_cache"][0] is linear_cache
+    assert seen["prompt_cache"][1] is attention_cache
+    assert linear_cache.rewind_calls == [2]
+    assert attention_cache.rewind_calls == [2]
+    assert linear_cache.offset == 3
+    assert attention_cache.offset == 3
+    assert attention_cache.keys.shape[2] == 3
+
+
+def test_stream_generate_text_only_falls_back_to_dense_trim_when_shared_helper_missing():
+    class DenseLayer:
+        def __init__(self, offset):
+            self.offset = offset
+            self.keys = mx.zeros((1, 1, offset, 1))
+            self.values = mx.zeros((1, 1, offset, 1))
+
+    model = MockModel()
+    processor = MockProcessor()
+    prompt_cache_state = PromptCacheState()
+
+    dense_cache = DenseLayer(offset=5)
+    prompt_cache_state.token_ids = [11, 12, 13, 14, 15]
+    prompt_cache_state.cache = [dense_cache]
+
+    seen = {}
+
+    def fake_generate_step(input_ids, model, pixel_values, mask, **kwargs):
+        seen["input_ids"] = input_ids.tolist()
+        seen["prompt_cache"] = kwargs["prompt_cache"]
+        yield 2, [0.0]
+
+    with (
+        patch.object(generate_module, "generate_step", side_effect=fake_generate_step),
+        patch.object(
+            generate_module,
+            "wired_limit",
+            side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+        ),
+        patch.object(generate_module.mx, "clear_cache"),
+        patch.object(generate_module, "mlx_rewind_prompt_cache", None),
+    ):
+        list(
+            stream_generate(
+                model,
+                processor,
+                prompt="ignored",
+                input_ids=mx.array([[11, 12, 13, 99]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache_state=prompt_cache_state,
+            )
+        )
+
+    assert seen["input_ids"] == [[99]]
+    assert seen["prompt_cache"][0] is dense_cache
+    assert dense_cache.offset == 3
+    assert dense_cache.keys.shape[2] == 3
+    assert dense_cache.values.shape[2] == 3
 
 
 def test_normalize_resize_shape_expands_single_value():
