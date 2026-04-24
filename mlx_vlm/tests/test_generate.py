@@ -1161,6 +1161,64 @@ def test_stream_generate_text_only_falls_back_to_dense_trim_when_shared_helper_m
     assert dense_cache.values.shape[2] == 3
 
 
+def test_stream_generate_text_only_mixed_cache_fails_closed_when_shared_helper_missing():
+    class RewindOnlyLayer:
+        def __init__(self, offset):
+            self.offset = offset
+
+    class DenseLayer:
+        def __init__(self, offset):
+            self.offset = offset
+            self.keys = mx.zeros((1, 1, offset, 1))
+            self.values = mx.zeros((1, 1, offset, 1))
+
+    model = MockModel()
+    model.config.model_type = "qwen3_5"
+    processor = MockProcessor()
+    prompt_cache_state = PromptCacheState()
+
+    linear_cache = RewindOnlyLayer(offset=5)
+    dense_cache = DenseLayer(offset=5)
+    prompt_cache_state.token_ids = [11, 12, 13, 14, 15]
+    prompt_cache_state.cache = [linear_cache, dense_cache]
+    original_cache = prompt_cache_state.cache
+
+    seen = {}
+
+    def fake_generate_step(input_ids, model, pixel_values, mask, **kwargs):
+        seen["input_ids"] = input_ids.tolist()
+        seen["prompt_cache"] = kwargs.get("prompt_cache")
+        yield 2, [0.0]
+
+    with (
+        patch.object(generate_module, "generate_step", side_effect=fake_generate_step),
+        patch.object(
+            generate_module,
+            "wired_limit",
+            side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+        ),
+        patch.object(generate_module.mx, "clear_cache"),
+        patch.object(generate_module, "mlx_rewind_prompt_cache", None),
+    ):
+        list(
+            stream_generate(
+                model,
+                processor,
+                prompt="ignored",
+                input_ids=mx.array([[11, 12, 13, 99]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache_state=prompt_cache_state,
+            )
+        )
+
+    assert seen["input_ids"] == [[11, 12, 13, 99]]
+    assert seen["prompt_cache"] is not original_cache
+    assert dense_cache.offset == 5
+    assert dense_cache.keys.shape[2] == 5
+    assert dense_cache.values.shape[2] == 5
+
+
 def test_normalize_resize_shape_expands_single_value():
     assert normalize_resize_shape([224]) == (224, 224)
 

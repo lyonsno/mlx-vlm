@@ -403,6 +403,10 @@ def _trim_dense_text_only_prompt_cache(
 
     dense_layers = []
     for layer_cache in prompt_cache:
+        # Older mlx-lm builds do not expose the shared rewind helper. In that
+        # compatibility mode, fail closed unless every layer is dense and
+        # sliceable; partially trimming a mixed cache would leave non-dense
+        # layers at the wrong continuation boundary.
         if not (
             hasattr(layer_cache, "keys")
             and hasattr(layer_cache, "values")
