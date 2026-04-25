@@ -1,6 +1,7 @@
 import argparse
 import codecs
 import contextlib
+import copy
 import functools
 import json
 import time
@@ -449,6 +450,7 @@ def generate_step(
     sampler: Optional[Callable[[mx.array], mx.array]] = None,
     logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
     prefill_step_size: Optional[int] = DEFAULT_PREFILL_STEP_SIZE,
+    prompt_cache_capture_callback: Optional[Callable[[List[Any]], None]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -604,6 +606,10 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+        if prompt_cache_capture_callback is not None:
+            boundary_cache = copy.deepcopy(prompt_cache)
+            mx.eval([c.state for c in boundary_cache])
+            prompt_cache_capture_callback(boundary_cache)
 
     mx.async_eval(y)
 
@@ -793,6 +799,14 @@ def stream_generate(
             max_kv_size=kwargs.get("max_kv_size", None),
         )
     tracked_cache = kwargs["prompt_cache"]
+    prompt_boundary_cache = None
+    if prompt_cache_state is not None and text_only_prompt:
+
+        def on_prompt_boundary(boundary_cache):
+            nonlocal prompt_boundary_cache
+            prompt_boundary_cache = boundary_cache
+
+        kwargs["prompt_cache_capture_callback"] = on_prompt_boundary
 
     total_prompt_tokens = reused_prefix_len + input_ids.size
 
@@ -850,10 +864,13 @@ def stream_generate(
 
         # Save cache state for potential reuse on next turn
         if prompt_cache_state is not None:
-            all_ids = full_input_ids_list + [
-                t.item() if hasattr(t, "item") else t for t in generated_tokens
-            ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+            if prompt_boundary_cache is not None:
+                prompt_cache_state.update(full_input_ids_list, prompt_boundary_cache)
+            else:
+                all_ids = full_input_ids_list + [
+                    t.item() if hasattr(t, "item") else t for t in generated_tokens
+                ]
+                prompt_cache_state.update(all_ids, tracked_cache)
 
         # Cleanup after generation
         mx.clear_cache()

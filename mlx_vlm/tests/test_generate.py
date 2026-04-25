@@ -1161,6 +1161,112 @@ def test_stream_generate_text_only_falls_back_to_dense_trim_when_shared_helper_m
     assert dense_cache.values.shape[2] == 3
 
 
+def test_stream_generate_text_only_stores_prompt_boundary_not_generated_tail():
+    model = MockModel()
+    processor = MockProcessor()
+    prompt_cache_state = PromptCacheState()
+    boundary_cache = [object()]
+    generated_cache = [object()]
+    seen = {}
+
+    def fake_generate_step(input_ids, model, pixel_values, mask, **kwargs):
+        seen["prompt_cache"] = kwargs["prompt_cache"]
+        seen["callback_present"] = "prompt_cache_capture_callback" in kwargs
+        kwargs["prompt_cache_capture_callback"](boundary_cache)
+        yield 7, [0.0]
+
+    with (
+        patch.object(generate_module, "generate_step", side_effect=fake_generate_step),
+        patch.object(
+            generate_module,
+            "wired_limit",
+            side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+        ),
+        patch.object(
+            generate_module.cache, "make_prompt_cache", return_value=generated_cache
+        ),
+        patch.object(generate_module.mx, "clear_cache"),
+    ):
+        list(
+            stream_generate(
+                model,
+                processor,
+                prompt="ignored",
+                input_ids=mx.array([[11, 12, 13]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache_state=prompt_cache_state,
+            )
+        )
+
+    assert seen["prompt_cache"] is generated_cache
+    assert seen["callback_present"]
+    assert prompt_cache_state.token_ids == [11, 12, 13]
+    assert prompt_cache_state.cache is boundary_cache
+
+
+def test_stream_generate_text_only_reuses_real_mixed_prompt_boundary():
+    from mlx_lm.models.cache import ArraysCache, KVCache
+
+    model = MockModel()
+    processor = MockProcessor()
+    prompt_cache_state = PromptCacheState()
+
+    linear_cache = ArraysCache(size=2)
+    linear_cache[0] = mx.zeros((1, 3, 4))
+    linear_cache[1] = mx.zeros((1, 4, 5))
+    attention_cache = KVCache()
+    kv = mx.zeros((1, 1, 3, 1))
+    attention_cache.update_and_fetch(kv, kv)
+    boundary_cache = [linear_cache, attention_cache]
+    first_cache = [object()]
+    seen = []
+
+    def fake_generate_step(input_ids, model, pixel_values, mask, **kwargs):
+        seen.append((input_ids.tolist(), kwargs["prompt_cache"]))
+        if "prompt_cache_capture_callback" in kwargs:
+            kwargs["prompt_cache_capture_callback"](boundary_cache)
+        yield 7, [0.0]
+
+    with (
+        patch.object(generate_module, "generate_step", side_effect=fake_generate_step),
+        patch.object(
+            generate_module,
+            "wired_limit",
+            side_effect=lambda *args, **kwargs: contextlib.nullcontext(),
+        ),
+        patch.object(
+            generate_module.cache, "make_prompt_cache", return_value=first_cache
+        ),
+        patch.object(generate_module.mx, "clear_cache"),
+    ):
+        list(
+            stream_generate(
+                model,
+                processor,
+                prompt="ignored",
+                input_ids=mx.array([[11, 12, 13]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache_state=prompt_cache_state,
+            )
+        )
+        list(
+            stream_generate(
+                model,
+                processor,
+                prompt="ignored",
+                input_ids=mx.array([[11, 12, 13, 99]], dtype=mx.int32),
+                pixel_values=None,
+                mask=None,
+                prompt_cache_state=prompt_cache_state,
+            )
+        )
+
+    assert seen[0] == ([[11, 12, 13]], first_cache)
+    assert seen[1] == ([[99]], boundary_cache)
+
+
 def test_stream_generate_text_only_mixed_cache_fails_closed_when_shared_helper_missing():
     class RewindOnlyLayer:
         def __init__(self, offset):
