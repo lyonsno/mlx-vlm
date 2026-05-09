@@ -1,6 +1,7 @@
 """Tests for batch generation functionality in mlx_vlm.generate module."""
 
 import logging
+import copy
 import sys
 from argparse import Namespace
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -17,6 +19,7 @@ from mlx_vlm.generate import (
     BatchStats,
     GenerationBatch,
     GenerationResult,
+    PromptCacheState,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
     normalize_resize_shape,
@@ -93,6 +96,50 @@ class MockStoppingCriteria:
         if tokens:
             if isinstance(tokens, (list, set)):
                 self.eos_token_ids.extend(tokens)
+
+
+def _mixed_boundary_cache(prefix_len: int = 2):
+    cache = [ArraysCache(size=1), KVCache()]
+    cache[0][0] = mx.ones((1, 2, 3))
+    keys = mx.arange(prefix_len * 4).reshape(1, 1, prefix_len, 4)
+    cache[1].update_and_fetch(keys, keys + 100)
+    return cache, keys
+
+
+def test_prompt_cache_state_recovers_saved_mixed_boundary():
+    prompt_state = PromptCacheState()
+    boundary, keys = _mixed_boundary_cache(prefix_len=2)
+    final_cache = make_prompt_cache_boundary(boundary)
+    final_cache[0][0] = mx.zeros((1, 2, 3))
+    extra = mx.ones((1, 1, 2, 4)) * 7
+    final_cache[1].update_and_fetch(extra, extra + 100)
+
+    prompt_state.update(
+        [1, 2, 3, 4],
+        final_cache,
+        boundary_token_ids=[1, 2],
+        boundary_cache=boundary,
+    )
+
+    recovered = prompt_state.recover_prefix_cache(2)
+
+    assert recovered is not None
+    assert mx.array_equal(recovered[0][0], mx.ones((1, 2, 3)))
+    recovered_keys, recovered_values = recovered[1].state
+    assert recovered[1].offset == 2
+    assert mx.array_equal(recovered_keys, keys)
+    assert mx.array_equal(recovered_values, keys + 100)
+    assert final_cache[1].offset == 4
+
+
+def test_prompt_cache_state_refuses_mixed_rewind_without_boundary():
+    prompt_state = PromptCacheState()
+    boundary, _ = _mixed_boundary_cache(prefix_len=2)
+    final_cache = copy.deepcopy(boundary)
+    final_cache[1].update_and_fetch(mx.ones((1, 1, 2, 4)), mx.ones((1, 1, 2, 4)))
+    prompt_state.update([1, 2, 3, 4], final_cache)
+
+    assert prompt_state.recover_prefix_cache(2) is None
 
 
 class MockTokenizer:

@@ -15,6 +15,11 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_reduce
 from mlx_lm.generate import maybe_quantize_kv_cache as mlx_maybe_quantize_kv_cache
+from mlx_lm.models.cache import (
+    can_rewind_prompt_cache,
+    make_prompt_cache_boundary,
+    rewind_prompt_cache,
+)
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from tqdm import tqdm
 from transformers import PreTrainedTokenizer
@@ -396,6 +401,8 @@ class PromptCacheState:
     def __init__(self):
         self.cache: Optional[List[Any]] = None
         self.token_ids: Optional[List[int]] = None
+        self.boundary_cache: Optional[List[Any]] = None
+        self.boundary_token_ids: Optional[List[int]] = None
 
     def find_prefix_length(self, new_ids: list) -> int:
         """Return the number of leading tokens that match the cached ids."""
@@ -407,10 +414,48 @@ class PromptCacheState:
                 return i
         return max_len
 
-    def update(self, token_ids: list, kv_cache: list):
+    def recover_prefix_cache(self, prefix_len: int) -> Optional[List[Any]]:
+        """Return a cache recovered to ``prefix_len`` tokens, if exact recovery is known."""
+        if self.cache is None or self.token_ids is None:
+            return None
+        if prefix_len < 0 or prefix_len > len(self.token_ids):
+            return None
+        if prefix_len == len(self.token_ids):
+            return make_prompt_cache_boundary(self.cache)
+        if (
+            self.boundary_cache is not None
+            and self.boundary_token_ids is not None
+            and prefix_len == len(self.boundary_token_ids)
+            and self.boundary_token_ids == self.token_ids[:prefix_len]
+        ):
+            return make_prompt_cache_boundary(self.boundary_cache)
+
+        num_to_rewind = len(self.token_ids) - prefix_len
+        if can_rewind_prompt_cache(self.cache, num_to_rewind):
+            recovered = make_prompt_cache_boundary(self.cache)
+            if rewind_prompt_cache(recovered, num_to_rewind) == num_to_rewind:
+                return recovered
+        return None
+
+    def update(
+        self,
+        token_ids: list,
+        kv_cache: list,
+        *,
+        boundary_token_ids: Optional[list] = None,
+        boundary_cache: Optional[list] = None,
+    ):
         """Store the full token sequence and corresponding KV cache."""
         self.token_ids = list(token_ids)
         self.cache = kv_cache
+        self.boundary_token_ids = (
+            list(boundary_token_ids) if boundary_token_ids is not None else None
+        )
+        self.boundary_cache = (
+            make_prompt_cache_boundary(boundary_cache)
+            if boundary_cache is not None
+            else None
+        )
 
 
 def _prime_cached_prefix_rope_state(
@@ -1125,6 +1170,7 @@ def generate_step(
     draft_block_size: Optional[int] = None,
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
+    prompt_cache_boundary_callback: Optional[Callable[[List[Any]], None]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -1336,6 +1382,10 @@ def generate_step(
             input_ids = input_ids[:, -1:]
 
         y, logprobs = _step(input_ids, inputs_embeds=inputs_embeds)
+
+    if prompt_cache_boundary_callback is not None:
+        mx.eval([c.state for c in prompt_cache])
+        prompt_cache_boundary_callback(prompt_cache)
 
     mx.async_eval(y)
 
@@ -1560,7 +1610,10 @@ def stream_generate(
     if prompt_cache_state is not None and prompt_cache_state.cache is not None:
         prefix_len = prompt_cache_state.find_prefix_length(full_input_ids_list)
         if prefix_len > 0 and prefix_len < input_ids.shape[1]:
-            if _prime_cached_prefix_rope_state(model, input_ids, mask, kwargs):
+            kv_cache = prompt_cache_state.recover_prefix_cache(prefix_len)
+            if kv_cache is not None and _prime_cached_prefix_rope_state(
+                model, input_ids, mask, kwargs
+            ):
                 reused_prefix_len = prefix_len
                 # Trim to only new tokens
                 input_ids = input_ids[:, prefix_len:]
@@ -1575,17 +1628,6 @@ def stream_generate(
                 if not has_image_in_new:
                     pixel_values = None
                     kwargs.pop("cached_image_features", None)
-                # Reuse the saved KV cache (trimmed to prefix length)
-                kv_cache = prompt_cache_state.cache
-                # Trim cache to prefix_len in case it includes generated tokens
-                for c in kv_cache:
-                    if hasattr(c, "keys") and c.keys is not None:
-                        cached_len = c.keys.shape[2]
-                        if cached_len > prefix_len:
-                            c.keys = c.keys[:, :, :prefix_len, :]
-                            c.values = c.values[:, :, :prefix_len, :]
-                            if hasattr(c, "offset"):
-                                c.offset = prefix_len
                 kwargs["prompt_cache"] = kv_cache
 
     # APC: cross-request, hash-based prefix lookup. Only consulted if a per-turn
@@ -1723,6 +1765,15 @@ def stream_generate(
         thinking_criteria = getattr(tokenizer, "thinking_budget_criteria", None)
         exact_checkpoint_len = None
         exact_checkpoint = None
+        prompt_boundary_cache = None
+        prompt_cache_boundary = None
+
+        if prompt_cache_state is not None:
+
+            def prompt_cache_boundary(cache: List[Any]) -> None:
+                nonlocal prompt_boundary_cache
+                prompt_boundary_cache = make_prompt_cache_boundary(cache)
+
         if apc_manager is not None and apc_mode == "exact" and reused_prefix_len == 0:
             exact_checkpoint_len = max(
                 1,
@@ -1743,6 +1794,7 @@ def stream_generate(
             mask,
             prompt_cache_checkpoint=exact_checkpoint,
             prompt_cache_checkpoint_len=exact_checkpoint_len,
+            prompt_cache_boundary_callback=prompt_cache_boundary,
             **kwargs,
         )
         tic = time.perf_counter()
@@ -1811,7 +1863,12 @@ def stream_generate(
             all_ids = full_input_ids_list + [
                 t.item() if hasattr(t, "item") else t for t in generated_tokens
             ]
-            prompt_cache_state.update(all_ids, tracked_cache)
+            prompt_cache_state.update(
+                all_ids,
+                tracked_cache,
+                boundary_token_ids=full_input_ids_list,
+                boundary_cache=prompt_boundary_cache,
+            )
 
         # APC: harvest new blocks from the post-generation KV state.
         if apc_manager is not None and apc_mode == "block":
