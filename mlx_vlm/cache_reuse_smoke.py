@@ -52,6 +52,35 @@ class CacheReuseSmokeReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CacheReuseParityReport:
+    scenario: str
+    model: str
+    image: Optional[List[str]]
+    top_k: int
+    prompt_tokens: int
+    reused_tokens: int
+    boundary_count: int
+    main_cache_bytes: int
+    boundary_cache_bytes: int
+    total_cache_bytes: int
+    peak_memory_bytes: Optional[int]
+    image_token_id: Optional[int]
+    image_token_in_prompt: bool
+    image_token_in_suffix: bool
+    used_boundary_restore: bool
+    unsafe_rewind_refused: bool
+    generated_tail_removed: bool
+    recoverable: bool
+    cold_token: Optional[int]
+    reused_token: Optional[int]
+    tokens_match: bool
+    parity: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 def cache_nbytes(value: Any) -> int:
     if value is None:
         return 0
@@ -74,6 +103,69 @@ def prompt_cache_state_metrics(state: PromptCacheState) -> Dict[str, int]:
         "main_cache_bytes": main_cache_bytes,
         "boundary_cache_bytes": boundary_cache_bytes,
         "total_cache_bytes": main_cache_bytes + boundary_cache_bytes,
+    }
+
+
+def _logprob_values(logprobs: Any) -> List[float]:
+    if logprobs is None:
+        raise ValueError("Expected logprobs, got None.")
+    if hasattr(logprobs, "flatten"):
+        logprobs = logprobs.flatten().tolist()
+    return [float(v) for v in logprobs]
+
+
+def topk_logprob_snapshot(logprobs: Any, k: int) -> List[Dict[str, Union[int, float]]]:
+    values = _logprob_values(logprobs)
+    ranked = sorted(enumerate(values), key=lambda item: item[1], reverse=True)
+    return [
+        {"token_id": int(token_id), "logprob": float(logprob)}
+        for token_id, logprob in ranked[:k]
+    ]
+
+
+def compare_topk_logprobs(cold_logprobs: Any, reused_logprobs: Any, k: int) -> Dict[str, Any]:
+    cold_values = _logprob_values(cold_logprobs)
+    reused_values = _logprob_values(reused_logprobs)
+    if len(cold_values) != len(reused_values):
+        raise ValueError(
+            f"Logprob lengths differ: cold={len(cold_values)} reused={len(reused_values)}"
+        )
+
+    cold_topk = topk_logprob_snapshot(cold_values, k)
+    reused_topk = topk_logprob_snapshot(reused_values, k)
+    cold_ids = [entry["token_id"] for entry in cold_topk]
+    reused_ids = [entry["token_id"] for entry in reused_topk]
+    cold_argmax = cold_ids[0] if cold_ids else None
+    reused_argmax = reused_ids[0] if reused_ids else None
+    argmax_delta = (
+        abs(float(cold_values[cold_argmax] - reused_values[cold_argmax]))
+        if cold_argmax is not None and cold_argmax == reused_argmax
+        else None
+    )
+    shared_ids = sorted(set(cold_ids) & set(reused_ids))
+    shared_deltas = [
+        {
+            "token_id": int(token_id),
+            "cold_logprob": float(cold_values[token_id]),
+            "reused_logprob": float(reused_values[token_id]),
+            "abs_delta": abs(float(cold_values[token_id] - reused_values[token_id])),
+        }
+        for token_id in shared_ids
+    ]
+    max_delta = max((entry["abs_delta"] for entry in shared_deltas), default=None)
+    return {
+        "cold_topk": cold_topk,
+        "reused_topk": reused_topk,
+        "cold_argmax_token_id": cold_argmax,
+        "reused_argmax_token_id": reused_argmax,
+        "argmax_token_id_match": cold_argmax == reused_argmax,
+        "argmax_abs_logprob_delta": argmax_delta,
+        "cold_topk_token_ids": cold_ids,
+        "reused_topk_token_ids": reused_ids,
+        "topk_token_ids_match": cold_ids == reused_ids,
+        "shared_topk_token_count": len(shared_ids),
+        "shared_topk_deltas": shared_deltas,
+        "max_abs_logprob_delta": max_delta,
     }
 
 
@@ -445,6 +537,232 @@ def run_image_multiturn_smoke(
     )
 
 
+def _token_value(token: Any) -> Optional[int]:
+    if token is None:
+        return None
+    if hasattr(token, "item"):
+        return int(token.item())
+    return int(token)
+
+
+def run_image_prefix_parity(
+    *,
+    model_path: str,
+    image: Union[str, Sequence[str]],
+    prefix_prompt: str,
+    second_suffix: str,
+    top_k: int,
+    resize_shape: Optional[Union[int, Sequence[int]]] = None,
+    trust_remote_code: bool = False,
+    processor_kwargs: Optional[Dict[str, Any]] = None,
+) -> CacheReuseParityReport:
+    images = _as_list(image)
+    model, processor = load(model_path, trust_remote_code=trust_remote_code)
+    config = _config_dict(model)
+    num_images = len(images or [])
+    first_prompt = apply_chat_template(
+        processor, config, prefix_prompt, num_images=num_images
+    )
+    first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        first_prompt,
+        image=images,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    second_inputs = append_suffix_tokens_to_inputs(first_inputs, suffix_tokens)
+    first_ids = first_inputs["input_ids"].flatten().tolist()
+    second_ids = second_inputs["input_ids"].flatten().tolist()
+    image_token_id = _image_token_id(model)
+
+    state = PromptCacheState()
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        prompt_cache_state=state,
+        **generation_kwargs_from_inputs(first_inputs),
+    )
+
+    plan = inspect_prompt_reuse(state, second_ids)
+    cold_result = generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        **generation_kwargs_from_inputs(second_inputs),
+    )
+    reused_result = generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        prompt_cache_state=state,
+        **generation_kwargs_from_inputs(second_inputs),
+    )
+
+    metrics = prompt_cache_state_metrics(state)
+    peak_memory_bytes = (
+        int(mx.get_peak_memory()) if hasattr(mx, "get_peak_memory") else None
+    )
+    cold_token = _token_value(cold_result.token)
+    reused_token = _token_value(reused_result.token)
+    return CacheReuseParityReport(
+        scenario="image_prefix_diverged_suffix_parity",
+        model=model_path,
+        image=images,
+        top_k=top_k,
+        prompt_tokens=plan.prompt_tokens,
+        reused_tokens=plan.reused_tokens,
+        boundary_count=metrics["boundary_count"],
+        main_cache_bytes=metrics["main_cache_bytes"],
+        boundary_cache_bytes=metrics["boundary_cache_bytes"],
+        total_cache_bytes=metrics["total_cache_bytes"],
+        peak_memory_bytes=peak_memory_bytes,
+        image_token_id=image_token_id,
+        image_token_in_prompt=(
+            image_token_id is not None and image_token_id in first_ids
+        ),
+        image_token_in_suffix=(
+            image_token_id is not None and image_token_id in suffix_tokens
+        ),
+        used_boundary_restore=plan.used_boundary_restore,
+        unsafe_rewind_refused=plan.unsafe_rewind_refused,
+        generated_tail_removed=plan.generated_tail_removed,
+        recoverable=plan.recoverable,
+        cold_token=cold_token,
+        reused_token=reused_token,
+        tokens_match=cold_token == reused_token,
+        parity=compare_topk_logprobs(
+            cold_result.logprobs, reused_result.logprobs, top_k
+        ),
+    )
+
+
+def run_image_multiturn_parity(
+    *,
+    model_path: str,
+    image: Union[str, Sequence[str]],
+    prefix_prompt: str,
+    second_suffix: str,
+    top_k: int,
+    resize_shape: Optional[Union[int, Sequence[int]]] = None,
+    trust_remote_code: bool = False,
+    processor_kwargs: Optional[Dict[str, Any]] = None,
+) -> CacheReuseParityReport:
+    images = _as_list(image)
+    model, processor = load(model_path, trust_remote_code=trust_remote_code)
+    config = _config_dict(model)
+    num_images = len(images or [])
+    first_prompt = apply_chat_template(
+        processor, config, prefix_prompt, num_images=num_images
+    )
+    first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        first_prompt,
+        image=images,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    first_ids = first_inputs["input_ids"].flatten().tolist()
+    image_token_id = _image_token_id(model)
+
+    state = PromptCacheState()
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        prompt_cache_state=state,
+        **generation_kwargs_from_inputs(first_inputs),
+    )
+    if state.token_ids is None:
+        raise RuntimeError("Prompt cache state did not capture the first turn.")
+
+    second_inputs = append_suffix_tokens_to_cached_turn_inputs(
+        first_inputs,
+        cached_token_ids=state.token_ids,
+        suffix_tokens=suffix_tokens,
+    )
+    second_ids = second_inputs["input_ids"].flatten().tolist()
+    plan = inspect_prompt_reuse(state, second_ids)
+    cold_result = generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        **generation_kwargs_from_inputs(second_inputs),
+    )
+    reused_result = generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        prompt_cache_state=state,
+        **generation_kwargs_from_inputs(second_inputs),
+    )
+
+    metrics = prompt_cache_state_metrics(state)
+    peak_memory_bytes = (
+        int(mx.get_peak_memory()) if hasattr(mx, "get_peak_memory") else None
+    )
+    cold_token = _token_value(cold_result.token)
+    reused_token = _token_value(reused_result.token)
+    return CacheReuseParityReport(
+        scenario="image_multiturn_text_followup_parity",
+        model=model_path,
+        image=images,
+        top_k=top_k,
+        prompt_tokens=plan.prompt_tokens,
+        reused_tokens=plan.reused_tokens,
+        boundary_count=metrics["boundary_count"],
+        main_cache_bytes=metrics["main_cache_bytes"],
+        boundary_cache_bytes=metrics["boundary_cache_bytes"],
+        total_cache_bytes=metrics["total_cache_bytes"],
+        peak_memory_bytes=peak_memory_bytes,
+        image_token_id=image_token_id,
+        image_token_in_prompt=(
+            image_token_id is not None and image_token_id in first_ids
+        ),
+        image_token_in_suffix=(
+            image_token_id is not None and image_token_id in suffix_tokens
+        ),
+        used_boundary_restore=plan.used_boundary_restore,
+        unsafe_rewind_refused=plan.unsafe_rewind_refused,
+        generated_tail_removed=plan.generated_tail_removed,
+        recoverable=plan.recoverable,
+        cold_token=cold_token,
+        reused_token=reused_token,
+        tokens_match=cold_token == reused_token,
+        parity=compare_topk_logprobs(
+            cold_result.logprobs, reused_result.logprobs, top_k
+        ),
+    )
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a structured VLM prompt-cache reuse smoke."
@@ -452,7 +770,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--model", required=True, help="Local path or HF repo id.")
     parser.add_argument(
         "--scenario",
-        choices=["image-prefix", "image-multiturn"],
+        choices=[
+            "image-prefix",
+            "image-multiturn",
+            "image-prefix-parity",
+            "image-multiturn-parity",
+        ],
         default="image-prefix",
     )
     parser.add_argument(
@@ -469,6 +792,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="Suffix appended to the second prompt after the shared prefix.",
     )
     parser.add_argument("--max-tokens", type=int, default=8)
+    parser.add_argument("--top-k", type=int, default=10)
     parser.add_argument("--resize-shape", type=int, nargs="+", default=None)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--processor-kwargs", type=json.loads, default={})
@@ -478,21 +802,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    run_smoke = (
-        run_image_multiturn_smoke
-        if args.scenario == "image-multiturn"
-        else run_image_prefix_smoke
-    )
-    report = run_smoke(
+    scenario_runners = {
+        "image-prefix": run_image_prefix_smoke,
+        "image-multiturn": run_image_multiturn_smoke,
+        "image-prefix-parity": run_image_prefix_parity,
+        "image-multiturn-parity": run_image_multiturn_parity,
+    }
+    run_smoke = scenario_runners[args.scenario]
+    common_kwargs = dict(
         model_path=args.model,
         image=args.image,
         prefix_prompt=args.prefix_prompt,
         second_suffix=args.second_suffix,
-        max_tokens=args.max_tokens,
         resize_shape=args.resize_shape,
         trust_remote_code=args.trust_remote_code,
         processor_kwargs=args.processor_kwargs,
     )
+    if args.scenario.endswith("-parity"):
+        report = run_smoke(top_k=args.top_k, **common_kwargs)
+    else:
+        report = run_smoke(max_tokens=args.max_tokens, **common_kwargs)
     payload = json.dumps(report.to_dict(), indent=2, sort_keys=True)
     if args.json_out is not None:
         args.json_out.write_text(payload + "\n", encoding="utf-8")

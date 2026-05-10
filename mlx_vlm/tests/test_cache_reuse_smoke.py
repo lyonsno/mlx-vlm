@@ -9,8 +9,10 @@ from mlx_vlm.cache_reuse_smoke import (
     append_suffix_tokens_to_cached_turn_inputs,
     append_suffix_tokens_to_inputs,
     cache_nbytes,
+    compare_topk_logprobs,
     inspect_prompt_reuse,
     prompt_cache_state_metrics,
+    topk_logprob_snapshot,
 )
 from mlx_vlm.generate import PromptCacheState
 
@@ -142,6 +144,33 @@ def test_append_suffix_tokens_to_cached_turn_inputs_extends_generated_state():
     assert extended["attention_mask"].tolist() == [[1, 1, 1, 1, 1, 1, 1]]
     assert mx.array_equal(extended["pixel_values"], inputs["pixel_values"])
     assert mx.array_equal(extended["image_grid_thw"], inputs["image_grid_thw"])
+
+
+def test_topk_logprob_snapshot_records_ranked_tokens_and_values():
+    snapshot = topk_logprob_snapshot(mx.array([-4.0, -1.0, -3.0, -2.0]), k=3)
+
+    assert snapshot == [
+        {"token_id": 1, "logprob": -1.0},
+        {"token_id": 3, "logprob": -2.0},
+        {"token_id": 2, "logprob": -3.0},
+    ]
+
+
+def test_compare_topk_logprobs_reports_shared_token_delta():
+    cold = mx.array([-4.0, -1.0, -3.0, -2.0])
+    reused = mx.array([-4.0, -1.25, -2.75, -2.0])
+
+    comparison = compare_topk_logprobs(cold, reused, k=3)
+
+    assert comparison["cold_topk_token_ids"] == [1, 3, 2]
+    assert comparison["reused_topk_token_ids"] == [1, 3, 2]
+    assert comparison["cold_argmax_token_id"] == 1
+    assert comparison["reused_argmax_token_id"] == 1
+    assert comparison["argmax_token_id_match"] is True
+    assert comparison["argmax_abs_logprob_delta"] == 0.25
+    assert comparison["topk_token_ids_match"] is True
+    assert comparison["shared_topk_token_count"] == 3
+    assert comparison["max_abs_logprob_delta"] == 0.25
 
 
 def test_smoke_report_json_preserves_answer_bank_fields():
