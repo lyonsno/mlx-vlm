@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
-from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    make_prompt_cache_boundary,
+    restore_prompt_cache_boundary,
+)
 
 from mlx_vlm import apc as apc_module
 from mlx_vlm.generate import (
@@ -22,6 +27,7 @@ from mlx_vlm.generate import (
     PromptCacheState,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
+    generate_step,
     normalize_resize_shape,
 )
 from mlx_vlm.utils import ThinkingBudgetCriteria
@@ -142,6 +148,108 @@ def test_prompt_cache_state_refuses_mixed_rewind_without_boundary():
     assert prompt_state.recover_prefix_cache(2) is None
 
 
+def _argmax_sampler(logprobs):
+    return mx.argmax(logprobs, axis=-1)
+
+
+def test_vlm_prompt_boundary_restore_matches_cold_prefill_logprobs():
+    model = DeterministicVLM()
+    prefix = mx.array([[1, 2, 3]], dtype=mx.int32)
+    suffix = mx.array([[4, 5]], dtype=mx.int32)
+    cold_prompt = mx.concatenate([prefix, suffix], axis=1)
+
+    cold_tok, cold_logprobs = next(
+        generate_step(
+            cold_prompt,
+            model,
+            pixel_values=mx.ones((1, 3, 2, 2)),
+            mask=mx.ones_like(cold_prompt),
+            max_tokens=1,
+            sampler=_argmax_sampler,
+        )
+    )
+
+    prompt_cache = model.language_model.make_cache()
+    boundaries = []
+    list(
+        generate_step(
+            prefix,
+            model,
+            pixel_values=mx.ones((1, 3, 2, 2)),
+            mask=mx.ones_like(prefix),
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            sampler=_argmax_sampler,
+            prompt_cache_boundary_callback=lambda cache: boundaries.append(
+                make_prompt_cache_boundary(cache)
+            ),
+        )
+    )
+
+    assert len(boundaries) == 1
+    restore_prompt_cache_boundary(prompt_cache, boundaries[0])
+    cached_tok, cached_logprobs = next(
+        generate_step(
+            suffix,
+            model,
+            pixel_values=None,
+            mask=mx.ones_like(suffix),
+            prompt_cache=prompt_cache,
+            max_tokens=1,
+            sampler=_argmax_sampler,
+        )
+    )
+
+    assert cached_tok == cold_tok
+    assert bool(mx.allclose(cached_logprobs, cold_logprobs, rtol=1e-5, atol=1e-5))
+
+
+def test_vlm_full_current_cache_extension_matches_cold_prefill_logprobs():
+    model = DeterministicVLM()
+    prefix = mx.array([[1, 2, 3]], dtype=mx.int32)
+    suffix = mx.array([[6, 7]], dtype=mx.int32)
+
+    prompt_cache = model.language_model.make_cache()
+    generated = list(
+        generate_step(
+            prefix,
+            model,
+            pixel_values=mx.ones((1, 3, 2, 2)),
+            mask=mx.ones_like(prefix),
+            prompt_cache=prompt_cache,
+            max_tokens=2,
+            sampler=_argmax_sampler,
+        )
+    )
+    generated_tokens = mx.array([[tok for tok, _ in generated]], dtype=mx.int32)
+    cold_prompt = mx.concatenate([prefix, generated_tokens, suffix], axis=1)
+    cold_tok, cold_logprobs = next(
+        generate_step(
+            cold_prompt,
+            model,
+            pixel_values=mx.ones((1, 3, 2, 2)),
+            mask=mx.ones_like(cold_prompt),
+            max_tokens=1,
+            sampler=_argmax_sampler,
+        )
+    )
+
+    cached_tok, cached_logprobs = next(
+        generate_step(
+            suffix,
+            model,
+            pixel_values=None,
+            mask=mx.ones_like(suffix),
+            prompt_cache=prompt_cache,
+            max_tokens=1,
+            sampler=_argmax_sampler,
+        )
+    )
+
+    assert cached_tok == cold_tok
+    assert bool(mx.allclose(cached_logprobs, cold_logprobs, rtol=1e-5, atol=1e-5))
+
+
 class MockTokenizer:
     """Mock tokenizer for testing."""
 
@@ -194,6 +302,58 @@ class MockProcessor:
             "attention_mask": mx.ones((batch_size, 10), dtype=mx.int32),
             "pixel_values": mx.zeros((batch_size, 3, 224, 224)) if images else None,
         }
+
+
+class DeterministicEmbeddingOutput:
+    def __init__(self, inputs_embeds):
+        self.inputs_embeds = inputs_embeds
+
+    def to_dict(self):
+        return {"inputs_embeds": self.inputs_embeds}
+
+
+class DeterministicLanguageModel:
+    def make_cache(self):
+        return [KVCache()]
+
+    def __call__(
+        self,
+        inputs=None,
+        inputs_embeds=None,
+        cache=None,
+        **kwargs,
+    ):
+        input_ids = inputs if inputs is not None else kwargs.get("input_ids")
+        if input_ids is None:
+            input_ids = mx.zeros(inputs_embeds.shape[:2], dtype=mx.int32)
+        if input_ids.ndim == 1:
+            input_ids = input_ids[None, :]
+
+        offset = cache[0].offset if cache is not None else 0
+        positions = mx.arange(offset, offset + input_ids.shape[1])[None, :]
+        base = input_ids.astype(mx.float32) + positions.astype(mx.float32)
+        logits = mx.stack([base, base + 1, base - 1, -base], axis=-1)
+
+        if cache is not None:
+            keys = mx.zeros((input_ids.shape[0], 1, input_ids.shape[1], 1))
+            cache[0].update_and_fetch(keys, keys)
+
+        return SimpleNamespace(
+            logits=logits,
+            cross_attention_states=None,
+            encoder_outputs=None,
+        )
+
+
+class DeterministicVLM:
+    def __init__(self):
+        self.config = SimpleNamespace(model_type="deterministic", image_token_index=99)
+        self.language_model = DeterministicLanguageModel()
+
+    def get_input_embeddings(self, input_ids, pixel_values=None, mask=None, **kwargs):
+        return DeterministicEmbeddingOutput(
+            mx.zeros((*input_ids.shape, 2), dtype=mx.float32)
+        )
 
 
 @pytest.fixture
