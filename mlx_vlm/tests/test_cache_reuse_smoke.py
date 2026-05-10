@@ -6,6 +6,7 @@ from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
 from mlx_vlm.cache_reuse_smoke import (
     CacheReuseSmokeReport,
     PromptReusePlan,
+    append_suffix_tokens_to_inputs,
     cache_nbytes,
     inspect_prompt_reuse,
     prompt_cache_state_metrics,
@@ -80,6 +81,22 @@ def test_inspect_prompt_reuse_identifies_boundary_restore_and_refused_rewind():
     )
 
 
+def test_append_suffix_tokens_to_inputs_preserves_exact_prefix():
+    inputs = {
+        "input_ids": mx.array([[10, 20, 30]], dtype=mx.int32),
+        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
+        "pixel_values": mx.ones((1, 3, 2, 2)),
+        "image_grid_thw": mx.array([[1, 2, 2]], dtype=mx.int32),
+    }
+
+    extended = append_suffix_tokens_to_inputs(inputs, [40, 50])
+
+    assert extended["input_ids"].tolist() == [[10, 20, 30, 40, 50]]
+    assert extended["attention_mask"].tolist() == [[1, 1, 1, 1, 1]]
+    assert mx.array_equal(extended["pixel_values"], inputs["pixel_values"])
+    assert mx.array_equal(extended["image_grid_thw"], inputs["image_grid_thw"])
+
+
 def test_smoke_report_json_preserves_answer_bank_fields():
     report = CacheReuseSmokeReport(
         scenario="image_prefix_diverged_suffix",
@@ -92,6 +109,9 @@ def test_smoke_report_json_preserves_answer_bank_fields():
         boundary_cache_bytes=40,
         total_cache_bytes=140,
         peak_memory_bytes=1024,
+        image_token_id=151655,
+        image_token_in_prompt=True,
+        image_token_in_suffix=False,
         first_wall_time_s=1.25,
         second_wall_time_s=0.75,
         used_boundary_restore=True,
@@ -107,5 +127,7 @@ def test_smoke_report_json_preserves_answer_bank_fields():
     encoded = json.dumps(payload, sort_keys=True)
 
     assert json.loads(encoded)["scenario"] == "image_prefix_diverged_suffix"
+    assert payload["image_token_in_prompt"] is True
+    assert payload["image_token_in_suffix"] is False
     assert payload["used_boundary_restore"] is True
     assert payload["boundary_cache_bytes"] == 40

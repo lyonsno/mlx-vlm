@@ -35,6 +35,9 @@ class CacheReuseSmokeReport:
     boundary_cache_bytes: int
     total_cache_bytes: int
     peak_memory_bytes: Optional[int]
+    image_token_id: Optional[int]
+    image_token_in_prompt: bool
+    image_token_in_suffix: bool
     first_wall_time_s: float
     second_wall_time_s: float
     used_boundary_restore: bool
@@ -135,7 +138,7 @@ def _add_special_tokens(model: Any, processor: Any) -> bool:
     return True
 
 
-def _input_ids_for_prompt(
+def prepare_prompt_inputs(
     model: Any,
     processor: Any,
     prompt: str,
@@ -143,8 +146,8 @@ def _input_ids_for_prompt(
     image: Optional[List[str]],
     resize_shape: Optional[Union[int, Sequence[int]]],
     processor_kwargs: Optional[Dict[str, Any]] = None,
-) -> List[int]:
-    inputs = prepare_inputs(
+) -> Dict[str, Any]:
+    return prepare_inputs(
         processor,
         images=image,
         prompts=prompt,
@@ -155,7 +158,42 @@ def _input_ids_for_prompt(
         add_special_tokens=_add_special_tokens(model, processor),
         **(processor_kwargs or {}),
     )
-    return inputs["input_ids"].flatten().tolist()
+
+
+def append_suffix_tokens_to_inputs(
+    inputs: Dict[str, Any], suffix_tokens: Sequence[int]
+) -> Dict[str, Any]:
+    suffix_tokens = list(suffix_tokens)
+    if not suffix_tokens:
+        return dict(inputs)
+
+    extended = dict(inputs)
+    input_ids = inputs["input_ids"]
+    suffix = mx.array([suffix_tokens], dtype=input_ids.dtype)
+    extended["input_ids"] = mx.concatenate([input_ids, suffix], axis=1)
+
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        suffix_mask = mx.ones(
+            (attention_mask.shape[0], len(suffix_tokens)),
+            dtype=attention_mask.dtype,
+        )
+        extended["attention_mask"] = mx.concatenate(
+            [attention_mask, suffix_mask], axis=1
+        )
+    return extended
+
+
+def generation_kwargs_from_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    kwargs = {
+        k: v
+        for k, v in inputs.items()
+        if k not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+    kwargs["input_ids"] = inputs["input_ids"]
+    kwargs["pixel_values"] = inputs.get("pixel_values", None)
+    kwargs["mask"] = inputs.get("attention_mask", None)
+    return kwargs
 
 
 def _image_state_contract(model: Any, prompt: str, plan: PromptReusePlan) -> str:
@@ -168,6 +206,13 @@ def _image_state_contract(model: Any, prompt: str, plan: PromptReusePlan) -> str
     if not plan.recoverable:
         return "not_recovered"
     return "reprimed_or_not_in_suffix"
+
+
+def _image_token_id(model: Any) -> Optional[int]:
+    image_token_id = getattr(getattr(model, "config", None), "image_token_id", None)
+    return image_token_id or getattr(
+        getattr(model, "config", None), "image_token_index", None
+    )
 
 
 def run_image_prefix_smoke(
@@ -188,9 +233,25 @@ def run_image_prefix_smoke(
     first_prompt = apply_chat_template(
         processor, config, prefix_prompt, num_images=num_images
     )
-    second_prompt = apply_chat_template(
-        processor, config, prefix_prompt + second_suffix, num_images=num_images
+    first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        first_prompt,
+        image=images,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
     )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    second_inputs = append_suffix_tokens_to_inputs(first_inputs, suffix_tokens)
+    first_ids = first_inputs["input_ids"].flatten().tolist()
+    second_ids = second_inputs["input_ids"].flatten().tolist()
+    image_token_id = _image_token_id(model)
+
+    first_kwargs = generation_kwargs_from_inputs(first_inputs)
+    second_kwargs = generation_kwargs_from_inputs(second_inputs)
+
+    second_prompt_label = f"{first_prompt}{second_suffix}"
 
     state = PromptCacheState()
     if hasattr(mx, "reset_peak_memory"):
@@ -199,35 +260,27 @@ def run_image_prefix_smoke(
     first_result = generate(
         model,
         processor,
-        first_prompt,
-        image=images,
+        "",
+        image=None,
         max_tokens=max_tokens,
         resize_shape=resize_shape,
         prompt_cache_state=state,
-        **(processor_kwargs or {}),
+        **first_kwargs,
     )
     first_wall_time = time.perf_counter() - first_start
 
-    second_ids = _input_ids_for_prompt(
-        model,
-        processor,
-        second_prompt,
-        image=images,
-        resize_shape=resize_shape,
-        processor_kwargs=processor_kwargs,
-    )
     plan = inspect_prompt_reuse(state, second_ids)
 
     second_start = time.perf_counter()
     second_result = generate(
         model,
         processor,
-        second_prompt,
-        image=images,
+        "",
+        image=None,
         max_tokens=max_tokens,
         resize_shape=resize_shape,
         prompt_cache_state=state,
-        **(processor_kwargs or {}),
+        **second_kwargs,
     )
     second_wall_time = time.perf_counter() - second_start
 
@@ -246,13 +299,20 @@ def run_image_prefix_smoke(
         boundary_cache_bytes=metrics["boundary_cache_bytes"],
         total_cache_bytes=metrics["total_cache_bytes"],
         peak_memory_bytes=peak_memory_bytes,
+        image_token_id=image_token_id,
+        image_token_in_prompt=(
+            image_token_id is not None and image_token_id in first_ids
+        ),
+        image_token_in_suffix=(
+            image_token_id is not None and image_token_id in suffix_tokens
+        ),
         first_wall_time_s=first_wall_time,
         second_wall_time_s=second_wall_time,
         used_boundary_restore=plan.used_boundary_restore,
         unsafe_rewind_refused=plan.unsafe_rewind_refused,
         generated_tail_removed=plan.generated_tail_removed,
         recoverable=plan.recoverable,
-        image_state_contract=_image_state_contract(model, second_prompt, plan),
+        image_state_contract=_image_state_contract(model, second_prompt_label, plan),
         first_text=first_result.text,
         second_text=second_result.text,
     )
