@@ -555,6 +555,7 @@ def run_image_prefix_parity(
     resize_shape: Optional[Union[int, Sequence[int]]] = None,
     trust_remote_code: bool = False,
     processor_kwargs: Optional[Dict[str, Any]] = None,
+    parity_order: str = "cold-first",
 ) -> CacheReuseParityReport:
     images = _as_list(image)
     model, processor = load(model_path, trust_remote_code=trust_remote_code)
@@ -593,25 +594,48 @@ def run_image_prefix_parity(
     )
 
     plan = inspect_prompt_reuse(state, second_ids)
-    cold_result = generate(
-        model,
-        processor,
-        "",
-        image=None,
-        max_tokens=1,
-        resize_shape=resize_shape,
-        **generation_kwargs_from_inputs(second_inputs),
-    )
-    reused_result = generate(
-        model,
-        processor,
-        "",
-        image=None,
-        max_tokens=1,
-        resize_shape=resize_shape,
-        prompt_cache_state=state,
-        **generation_kwargs_from_inputs(second_inputs),
-    )
+    if parity_order == "cold-first":
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    elif parity_order == "reused-first":
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    else:
+        raise ValueError(f"Unsupported parity order: {parity_order}")
 
     metrics = prompt_cache_state_metrics(state)
     peak_memory_bytes = (
@@ -620,7 +644,7 @@ def run_image_prefix_parity(
     cold_token = _token_value(cold_result.token)
     reused_token = _token_value(reused_result.token)
     return CacheReuseParityReport(
-        scenario="image_prefix_diverged_suffix_parity",
+        scenario=f"image_prefix_diverged_suffix_parity_{parity_order}",
         model=model_path,
         image=images,
         top_k=top_k,
@@ -651,6 +675,266 @@ def run_image_prefix_parity(
     )
 
 
+def run_image_prefix_boundary_only_parity(
+    *,
+    model_path: str,
+    image: Union[str, Sequence[str]],
+    prefix_prompt: str,
+    second_suffix: str,
+    top_k: int,
+    resize_shape: Optional[Union[int, Sequence[int]]] = None,
+    trust_remote_code: bool = False,
+    processor_kwargs: Optional[Dict[str, Any]] = None,
+    parity_order: str = "cold-first",
+) -> CacheReuseParityReport:
+    images = _as_list(image)
+    model, processor = load(model_path, trust_remote_code=trust_remote_code)
+    config = _config_dict(model)
+    num_images = len(images or [])
+    first_prompt = apply_chat_template(
+        processor, config, prefix_prompt, num_images=num_images
+    )
+    first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        first_prompt,
+        image=images,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    second_inputs = append_suffix_tokens_to_inputs(first_inputs, suffix_tokens)
+    first_ids = first_inputs["input_ids"].flatten().tolist()
+    second_ids = second_inputs["input_ids"].flatten().tolist()
+    image_token_id = _image_token_id(model)
+
+    initial_state = PromptCacheState()
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        prompt_cache_state=initial_state,
+        **generation_kwargs_from_inputs(first_inputs),
+    )
+    if initial_state.boundary_cache is None or initial_state.boundary_token_ids is None:
+        raise RuntimeError("Prompt cache state did not capture a prompt boundary.")
+
+    state = PromptCacheState()
+    state.update(initial_state.boundary_token_ids, initial_state.boundary_cache)
+
+    plan = inspect_prompt_reuse(state, second_ids)
+    if parity_order == "cold-first":
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    elif parity_order == "reused-first":
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    else:
+        raise ValueError(f"Unsupported parity order: {parity_order}")
+
+    metrics = prompt_cache_state_metrics(state)
+    peak_memory_bytes = (
+        int(mx.get_peak_memory()) if hasattr(mx, "get_peak_memory") else None
+    )
+    cold_token = _token_value(cold_result.token)
+    reused_token = _token_value(reused_result.token)
+    return CacheReuseParityReport(
+        scenario=f"image_prefix_boundary_only_parity_{parity_order}",
+        model=model_path,
+        image=images,
+        top_k=top_k,
+        prompt_tokens=plan.prompt_tokens,
+        reused_tokens=plan.reused_tokens,
+        boundary_count=metrics["boundary_count"],
+        main_cache_bytes=metrics["main_cache_bytes"],
+        boundary_cache_bytes=metrics["boundary_cache_bytes"],
+        total_cache_bytes=metrics["total_cache_bytes"],
+        peak_memory_bytes=peak_memory_bytes,
+        image_token_id=image_token_id,
+        image_token_in_prompt=(
+            image_token_id is not None and image_token_id in first_ids
+        ),
+        image_token_in_suffix=(
+            image_token_id is not None and image_token_id in suffix_tokens
+        ),
+        used_boundary_restore=plan.used_boundary_restore,
+        unsafe_rewind_refused=plan.unsafe_rewind_refused,
+        generated_tail_removed=plan.generated_tail_removed,
+        recoverable=plan.recoverable,
+        cold_token=cold_token,
+        reused_token=reused_token,
+        tokens_match=cold_token == reused_token,
+        parity=compare_topk_logprobs(
+            cold_result.logprobs, reused_result.logprobs, top_k
+        ),
+    )
+
+
+def run_text_prefix_boundary_only_parity(
+    *,
+    model_path: str,
+    image: Optional[Union[str, Sequence[str]]],
+    prefix_prompt: str,
+    second_suffix: str,
+    top_k: int,
+    resize_shape: Optional[Union[int, Sequence[int]]] = None,
+    trust_remote_code: bool = False,
+    processor_kwargs: Optional[Dict[str, Any]] = None,
+    parity_order: str = "cold-first",
+) -> CacheReuseParityReport:
+    model, processor = load(model_path, trust_remote_code=trust_remote_code)
+    config = _config_dict(model)
+    first_prompt = apply_chat_template(processor, config, prefix_prompt, num_images=0)
+    first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        first_prompt,
+        image=None,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    second_inputs = append_suffix_tokens_to_inputs(first_inputs, suffix_tokens)
+    second_ids = second_inputs["input_ids"].flatten().tolist()
+
+    initial_state = PromptCacheState()
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        prompt_cache_state=initial_state,
+        **generation_kwargs_from_inputs(first_inputs),
+    )
+    if initial_state.boundary_cache is None or initial_state.boundary_token_ids is None:
+        raise RuntimeError("Prompt cache state did not capture a prompt boundary.")
+
+    state = PromptCacheState()
+    state.update(initial_state.boundary_token_ids, initial_state.boundary_cache)
+    plan = inspect_prompt_reuse(state, second_ids)
+
+    if parity_order == "cold-first":
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    elif parity_order == "reused-first":
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    else:
+        raise ValueError(f"Unsupported parity order: {parity_order}")
+
+    metrics = prompt_cache_state_metrics(state)
+    peak_memory_bytes = (
+        int(mx.get_peak_memory()) if hasattr(mx, "get_peak_memory") else None
+    )
+    cold_token = _token_value(cold_result.token)
+    reused_token = _token_value(reused_result.token)
+    return CacheReuseParityReport(
+        scenario=f"text_prefix_boundary_only_parity_{parity_order}",
+        model=model_path,
+        image=None,
+        top_k=top_k,
+        prompt_tokens=plan.prompt_tokens,
+        reused_tokens=plan.reused_tokens,
+        boundary_count=metrics["boundary_count"],
+        main_cache_bytes=metrics["main_cache_bytes"],
+        boundary_cache_bytes=metrics["boundary_cache_bytes"],
+        total_cache_bytes=metrics["total_cache_bytes"],
+        peak_memory_bytes=peak_memory_bytes,
+        image_token_id=_image_token_id(model),
+        image_token_in_prompt=False,
+        image_token_in_suffix=False,
+        used_boundary_restore=plan.used_boundary_restore,
+        unsafe_rewind_refused=plan.unsafe_rewind_refused,
+        generated_tail_removed=plan.generated_tail_removed,
+        recoverable=plan.recoverable,
+        cold_token=cold_token,
+        reused_token=reused_token,
+        tokens_match=cold_token == reused_token,
+        parity=compare_topk_logprobs(
+            cold_result.logprobs, reused_result.logprobs, top_k
+        ),
+    )
+
+
 def run_image_multiturn_parity(
     *,
     model_path: str,
@@ -661,6 +945,7 @@ def run_image_multiturn_parity(
     resize_shape: Optional[Union[int, Sequence[int]]] = None,
     trust_remote_code: bool = False,
     processor_kwargs: Optional[Dict[str, Any]] = None,
+    parity_order: str = "cold-first",
 ) -> CacheReuseParityReport:
     images = _as_list(image)
     model, processor = load(model_path, trust_remote_code=trust_remote_code)
@@ -705,25 +990,48 @@ def run_image_multiturn_parity(
     )
     second_ids = second_inputs["input_ids"].flatten().tolist()
     plan = inspect_prompt_reuse(state, second_ids)
-    cold_result = generate(
-        model,
-        processor,
-        "",
-        image=None,
-        max_tokens=1,
-        resize_shape=resize_shape,
-        **generation_kwargs_from_inputs(second_inputs),
-    )
-    reused_result = generate(
-        model,
-        processor,
-        "",
-        image=None,
-        max_tokens=1,
-        resize_shape=resize_shape,
-        prompt_cache_state=state,
-        **generation_kwargs_from_inputs(second_inputs),
-    )
+    if parity_order == "cold-first":
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    elif parity_order == "reused-first":
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            prompt_cache_state=state,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **generation_kwargs_from_inputs(second_inputs),
+        )
+    else:
+        raise ValueError(f"Unsupported parity order: {parity_order}")
 
     metrics = prompt_cache_state_metrics(state)
     peak_memory_bytes = (
@@ -732,7 +1040,7 @@ def run_image_multiturn_parity(
     cold_token = _token_value(cold_result.token)
     reused_token = _token_value(reused_result.token)
     return CacheReuseParityReport(
-        scenario="image_multiturn_text_followup_parity",
+        scenario=f"image_multiturn_text_followup_parity_{parity_order}",
         model=model_path,
         image=images,
         top_k=top_k,
@@ -774,12 +1082,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "image-prefix",
             "image-multiturn",
             "image-prefix-parity",
+            "image-prefix-boundary-only-parity",
             "image-multiturn-parity",
+            "text-prefix-boundary-only-parity",
         ],
         default="image-prefix",
     )
     parser.add_argument(
-        "--image", nargs="+", required=True, help="Image path(s) or URL(s)."
+        "--image", nargs="+", default=None, help="Image path(s) or URL(s)."
     )
     parser.add_argument(
         "--prefix-prompt",
@@ -793,6 +1103,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument(
+        "--parity-order",
+        choices=["cold-first", "reused-first"],
+        default="cold-first",
+    )
     parser.add_argument("--resize-shape", type=int, nargs="+", default=None)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--processor-kwargs", type=json.loads, default={})
@@ -806,9 +1121,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "image-prefix": run_image_prefix_smoke,
         "image-multiturn": run_image_multiturn_smoke,
         "image-prefix-parity": run_image_prefix_parity,
+        "image-prefix-boundary-only-parity": run_image_prefix_boundary_only_parity,
         "image-multiturn-parity": run_image_multiturn_parity,
+        "text-prefix-boundary-only-parity": run_text_prefix_boundary_only_parity,
     }
     run_smoke = scenario_runners[args.scenario]
+    if args.scenario.startswith("image-") and args.image is None:
+        raise SystemExit(f"--image is required for scenario {args.scenario}")
     common_kwargs = dict(
         model_path=args.model,
         image=args.image,
@@ -819,7 +1138,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         processor_kwargs=args.processor_kwargs,
     )
     if args.scenario.endswith("-parity"):
-        report = run_smoke(top_k=args.top_k, **common_kwargs)
+        report = run_smoke(
+            top_k=args.top_k, parity_order=args.parity_order, **common_kwargs
+        )
     else:
         report = run_smoke(max_tokens=args.max_tokens, **common_kwargs)
     payload = json.dumps(report.to_dict(), indent=2, sort_keys=True)

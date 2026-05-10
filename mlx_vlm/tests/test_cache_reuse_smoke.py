@@ -11,6 +11,7 @@ from mlx_vlm.cache_reuse_smoke import (
     cache_nbytes,
     compare_topk_logprobs,
     inspect_prompt_reuse,
+    parse_args,
     prompt_cache_state_metrics,
     topk_logprob_snapshot,
 )
@@ -171,6 +172,41 @@ def test_compare_topk_logprobs_reports_shared_token_delta():
     assert comparison["topk_token_ids_match"] is True
     assert comparison["shared_topk_token_count"] == 3
     assert comparison["max_abs_logprob_delta"] == 0.25
+
+
+def test_parse_args_exposes_parity_order():
+    args = parse_args(
+        [
+            "--model",
+            "model",
+            "--image",
+            "image.png",
+            "--scenario",
+            "image-prefix-boundary-only-parity",
+            "--parity-order",
+            "reused-first",
+        ]
+    )
+
+    assert args.scenario == "image-prefix-boundary-only-parity"
+    assert args.parity_order == "reused-first"
+
+
+def test_parse_args_allows_text_boundary_parity_without_image():
+    args = parse_args(
+        [
+            "--model",
+            "model",
+            "--scenario",
+            "text-prefix-boundary-only-parity",
+            "--parity-order",
+            "reused-first",
+        ]
+    )
+
+    assert args.scenario == "text-prefix-boundary-only-parity"
+    assert args.image is None
+    assert args.parity_order == "reused-first"
 
 
 def test_smoke_report_json_preserves_answer_bank_fields():
