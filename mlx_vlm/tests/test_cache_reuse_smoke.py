@@ -6,6 +6,7 @@ from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
 from mlx_vlm.cache_reuse_smoke import (
     CacheReuseSmokeReport,
     PromptReusePlan,
+    append_suffix_tokens_to_cached_turn_inputs,
     append_suffix_tokens_to_inputs,
     cache_nbytes,
     inspect_prompt_reuse,
@@ -81,6 +82,32 @@ def test_inspect_prompt_reuse_identifies_boundary_restore_and_refused_rewind():
     )
 
 
+def test_inspect_prompt_reuse_identifies_full_turn_cache_extension():
+    boundary = _mixed_cache(prefix_len=2)
+    final_cache = make_prompt_cache_boundary(boundary)
+    tail = mx.ones((1, 1, 1, 4))
+    final_cache[1].update_and_fetch(tail, tail + 100)
+
+    state = PromptCacheState()
+    state.update(
+        [1, 2, 901],
+        final_cache,
+        boundary_token_ids=[1, 2],
+        boundary_cache=boundary,
+    )
+
+    plan = inspect_prompt_reuse(state, [1, 2, 901, 3, 4])
+
+    assert plan == PromptReusePlan(
+        prompt_tokens=5,
+        reused_tokens=3,
+        used_boundary_restore=False,
+        unsafe_rewind_refused=False,
+        generated_tail_removed=False,
+        recoverable=True,
+    )
+
+
 def test_append_suffix_tokens_to_inputs_preserves_exact_prefix():
     inputs = {
         "input_ids": mx.array([[10, 20, 30]], dtype=mx.int32),
@@ -93,6 +120,26 @@ def test_append_suffix_tokens_to_inputs_preserves_exact_prefix():
 
     assert extended["input_ids"].tolist() == [[10, 20, 30, 40, 50]]
     assert extended["attention_mask"].tolist() == [[1, 1, 1, 1, 1]]
+    assert mx.array_equal(extended["pixel_values"], inputs["pixel_values"])
+    assert mx.array_equal(extended["image_grid_thw"], inputs["image_grid_thw"])
+
+
+def test_append_suffix_tokens_to_cached_turn_inputs_extends_generated_state():
+    inputs = {
+        "input_ids": mx.array([[10, 20, 30]], dtype=mx.int32),
+        "attention_mask": mx.array([[1, 1, 1]], dtype=mx.int32),
+        "pixel_values": mx.ones((1, 3, 2, 2)),
+        "image_grid_thw": mx.array([[1, 2, 2]], dtype=mx.int32),
+    }
+
+    extended = append_suffix_tokens_to_cached_turn_inputs(
+        inputs,
+        cached_token_ids=[10, 20, 30, 901, 902],
+        suffix_tokens=[40, 50],
+    )
+
+    assert extended["input_ids"].tolist() == [[10, 20, 30, 901, 902, 40, 50]]
+    assert extended["attention_mask"].tolist() == [[1, 1, 1, 1, 1, 1, 1]]
     assert mx.array_equal(extended["pixel_values"], inputs["pixel_values"])
     assert mx.array_equal(extended["image_grid_thw"], inputs["image_grid_thw"])
 

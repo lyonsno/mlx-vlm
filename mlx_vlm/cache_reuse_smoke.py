@@ -184,6 +184,25 @@ def append_suffix_tokens_to_inputs(
     return extended
 
 
+def append_suffix_tokens_to_cached_turn_inputs(
+    inputs: Dict[str, Any],
+    *,
+    cached_token_ids: Sequence[int],
+    suffix_tokens: Sequence[int],
+) -> Dict[str, Any]:
+    token_ids = list(cached_token_ids) + list(suffix_tokens)
+    extended = dict(inputs)
+    extended["input_ids"] = mx.array([token_ids], dtype=inputs["input_ids"].dtype)
+
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is not None:
+        extended["attention_mask"] = mx.ones(
+            (attention_mask.shape[0], len(token_ids)),
+            dtype=attention_mask.dtype,
+        )
+    return extended
+
+
 def generation_kwargs_from_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
     kwargs = {
         k: v
@@ -318,11 +337,124 @@ def run_image_prefix_smoke(
     )
 
 
+def run_image_multiturn_smoke(
+    *,
+    model_path: str,
+    image: Union[str, Sequence[str]],
+    prefix_prompt: str,
+    second_suffix: str,
+    max_tokens: int,
+    resize_shape: Optional[Union[int, Sequence[int]]] = None,
+    trust_remote_code: bool = False,
+    processor_kwargs: Optional[Dict[str, Any]] = None,
+) -> CacheReuseSmokeReport:
+    images = _as_list(image)
+    model, processor = load(model_path, trust_remote_code=trust_remote_code)
+    config = _config_dict(model)
+    num_images = len(images or [])
+    first_prompt = apply_chat_template(
+        processor, config, prefix_prompt, num_images=num_images
+    )
+    first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        first_prompt,
+        image=images,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    first_ids = first_inputs["input_ids"].flatten().tolist()
+    image_token_id = _image_token_id(model)
+
+    first_kwargs = generation_kwargs_from_inputs(first_inputs)
+
+    state = PromptCacheState()
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    first_start = time.perf_counter()
+    first_result = generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=max_tokens,
+        resize_shape=resize_shape,
+        prompt_cache_state=state,
+        **first_kwargs,
+    )
+    first_wall_time = time.perf_counter() - first_start
+
+    if state.token_ids is None:
+        raise RuntimeError("Prompt cache state did not capture the first turn.")
+
+    second_inputs = append_suffix_tokens_to_cached_turn_inputs(
+        first_inputs,
+        cached_token_ids=state.token_ids,
+        suffix_tokens=suffix_tokens,
+    )
+    second_ids = second_inputs["input_ids"].flatten().tolist()
+    second_kwargs = generation_kwargs_from_inputs(second_inputs)
+    plan = inspect_prompt_reuse(state, second_ids)
+
+    second_start = time.perf_counter()
+    second_result = generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=max_tokens,
+        resize_shape=resize_shape,
+        prompt_cache_state=state,
+        **second_kwargs,
+    )
+    second_wall_time = time.perf_counter() - second_start
+
+    metrics = prompt_cache_state_metrics(state)
+    peak_memory_bytes = (
+        int(mx.get_peak_memory()) if hasattr(mx, "get_peak_memory") else None
+    )
+    return CacheReuseSmokeReport(
+        scenario="image_multiturn_text_followup",
+        model=model_path,
+        image=images,
+        prompt_tokens=plan.prompt_tokens,
+        reused_tokens=plan.reused_tokens,
+        boundary_count=metrics["boundary_count"],
+        main_cache_bytes=metrics["main_cache_bytes"],
+        boundary_cache_bytes=metrics["boundary_cache_bytes"],
+        total_cache_bytes=metrics["total_cache_bytes"],
+        peak_memory_bytes=peak_memory_bytes,
+        image_token_id=image_token_id,
+        image_token_in_prompt=(
+            image_token_id is not None and image_token_id in first_ids
+        ),
+        image_token_in_suffix=(
+            image_token_id is not None and image_token_id in suffix_tokens
+        ),
+        first_wall_time_s=first_wall_time,
+        second_wall_time_s=second_wall_time,
+        used_boundary_restore=plan.used_boundary_restore,
+        unsafe_rewind_refused=plan.unsafe_rewind_refused,
+        generated_tail_removed=plan.generated_tail_removed,
+        recoverable=plan.recoverable,
+        image_state_contract=_image_state_contract(model, second_suffix, plan),
+        first_text=first_result.text,
+        second_text=second_result.text,
+    )
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a structured VLM prompt-cache reuse smoke."
     )
     parser.add_argument("--model", required=True, help="Local path or HF repo id.")
+    parser.add_argument(
+        "--scenario",
+        choices=["image-prefix", "image-multiturn"],
+        default="image-prefix",
+    )
     parser.add_argument(
         "--image", nargs="+", required=True, help="Image path(s) or URL(s)."
     )
@@ -346,7 +478,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
-    report = run_image_prefix_smoke(
+    run_smoke = (
+        run_image_multiturn_smoke
+        if args.scenario == "image-multiturn"
+        else run_image_prefix_smoke
+    )
+    report = run_smoke(
         model_path=args.model,
         image=args.image,
         prefix_prompt=args.prefix_prompt,
