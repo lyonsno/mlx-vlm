@@ -4,9 +4,10 @@ import numbers
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import mlx.core as mx
+from mlx_lm.models.cache import make_prompt_cache_boundary
 
 from .generate import PromptCacheState, generate, normalize_resize_shape
 from .prompt_utils import apply_chat_template
@@ -81,6 +82,31 @@ class CacheReuseParityReport:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class CacheReuseBoundaryLedgerReport:
+    scenario: str
+    model: str
+    image: Optional[List[str]]
+    top_k: int
+    prompt_tokens: int
+    reused_tokens: int
+    image_token_id: Optional[int]
+    image_token_in_prompt: bool
+    image_token_in_suffix: bool
+    used_boundary_restore: bool
+    unsafe_rewind_refused: bool
+    generated_tail_removed: bool
+    recoverable: bool
+    cold_token: Optional[int]
+    reused_token: Optional[int]
+    tokens_match: bool
+    parity: Dict[str, Any]
+    ledger: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 def cache_nbytes(value: Any) -> int:
     if value is None:
         return 0
@@ -92,6 +118,224 @@ def cache_nbytes(value: Any) -> int:
     if isinstance(value, (list, tuple)):
         return sum(cache_nbytes(v) for v in value)
     return 0
+
+
+def _is_array(value: Any) -> bool:
+    return hasattr(value, "shape") and hasattr(value, "dtype") and hasattr(value, "flatten")
+
+
+def _array_preview(value: Any, limit: int = 8) -> List[Union[int, float, bool]]:
+    if value is None:
+        return []
+    flat = value.flatten().tolist()
+    return flat[: min(limit, len(flat))]
+
+
+def array_summary(value: Any, *, preview_limit: int = 8) -> Dict[str, Any]:
+    if value is None:
+        return {"present": False}
+    summary = {
+        "present": True,
+        "shape": list(value.shape),
+        "dtype": str(value.dtype),
+        "nbytes": int(getattr(value, "nbytes", 0)),
+        "preview": _array_preview(value, preview_limit),
+    }
+    if value.size > 0:
+        try:
+            summary["min"] = float(mx.min(value.astype(mx.float32)).item())
+            summary["max"] = float(mx.max(value.astype(mx.float32)).item())
+        except Exception:
+            pass
+    return summary
+
+
+def array_comparison(cold: Any, reused: Any) -> Dict[str, Any]:
+    if cold is None or reused is None:
+        return {
+            "cold_present": cold is not None,
+            "reused_present": reused is not None,
+            "shape_match": cold is None and reused is None,
+            "exact_match": cold is None and reused is None,
+            "max_abs_delta": None,
+        }
+    shape_match = tuple(cold.shape) == tuple(reused.shape)
+    if not shape_match:
+        return {
+            "cold_present": True,
+            "reused_present": True,
+            "cold_shape": list(cold.shape),
+            "reused_shape": list(reused.shape),
+            "shape_match": False,
+            "exact_match": False,
+            "max_abs_delta": None,
+        }
+    exact_match = bool(mx.array_equal(cold, reused))
+    max_abs_delta = None
+    if cold.size > 0:
+        max_abs_delta = float(
+            mx.max(mx.abs(cold.astype(mx.float32) - reused.astype(mx.float32))).item()
+        )
+    return {
+        "cold_present": True,
+        "reused_present": True,
+        "cold_shape": list(cold.shape),
+        "reused_shape": list(reused.shape),
+        "shape_match": True,
+        "exact_match": exact_match,
+        "max_abs_delta": max_abs_delta,
+    }
+
+
+def _flatten_arrays(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if _is_array(value):
+        return [value]
+    state = getattr(value, "state", None)
+    if state is not None and state is not value:
+        return _flatten_arrays(state)
+    if isinstance(value, dict):
+        arrays = []
+        for key in sorted(value):
+            arrays.extend(_flatten_arrays(value[key]))
+        return arrays
+    if isinstance(value, (list, tuple)):
+        arrays = []
+        for item in value:
+            arrays.extend(_flatten_arrays(item))
+        return arrays
+    return []
+
+
+def cache_state_comparison(cold_cache: Any, reused_cache: Any) -> Dict[str, Any]:
+    cold_arrays = _flatten_arrays(cold_cache)
+    reused_arrays = _flatten_arrays(reused_cache)
+    count_match = len(cold_arrays) == len(reused_arrays)
+    comparisons = [
+        array_comparison(cold, reused)
+        for cold, reused in zip(cold_arrays, reused_arrays)
+    ]
+    exact_match = count_match and all(item["exact_match"] for item in comparisons)
+    deltas = [
+        item["max_abs_delta"]
+        for item in comparisons
+        if item["max_abs_delta"] is not None
+    ]
+    return {
+        "cold_array_count": len(cold_arrays),
+        "reused_array_count": len(reused_arrays),
+        "array_count_match": count_match,
+        "exact_match": exact_match,
+        "max_abs_delta": max(deltas, default=None),
+        "entries": comparisons,
+    }
+
+
+def _cache_offsets(prompt_cache: Any) -> List[Dict[str, Any]]:
+    offsets = []
+    for index, entry in enumerate(prompt_cache or []):
+        offset = getattr(entry, "_idx", None)
+        source = "_idx"
+        if offset is None:
+            offset = getattr(entry, "offset", None)
+            source = "offset"
+        offsets.append(
+            {
+                "index": index,
+                "source": source if offset is not None else None,
+                "value": _array_preview(offset) if _is_array(offset) else offset,
+            }
+        )
+    return offsets
+
+
+def _first_scalar_cache_offset(prompt_cache: Any) -> int:
+    for entry in prompt_cache or []:
+        offset = getattr(entry, "_idx", None)
+        if offset is None:
+            offset = getattr(entry, "offset", None)
+        if offset is None:
+            continue
+        if _is_array(offset):
+            flat = offset.flatten().tolist()
+            return int(flat[0]) if flat else 0
+        return int(offset)
+    return 0
+
+
+def _position_ids_for_boundary(
+    *,
+    model: Any,
+    input_ids: Any,
+    prompt_cache: Any,
+    kwargs: Dict[str, Any],
+) -> Any:
+    lm = getattr(model, "language_model", None)
+    if lm is None:
+        return None
+    cache_offset = _first_scalar_cache_offset(prompt_cache)
+    position_ids = getattr(lm, "_position_ids", None)
+    if (
+        position_ids is not None
+        and position_ids.ndim == 3
+        and position_ids.shape[1] == input_ids.shape[0]
+        and position_ids.shape[-1] >= cache_offset + input_ids.shape[1]
+    ):
+        return position_ids[:, :, cache_offset : cache_offset + input_ids.shape[1]]
+    rope_deltas = kwargs.get("rope_deltas", None)
+    if rope_deltas is None:
+        rope_deltas = getattr(lm, "_rope_deltas", None)
+    if rope_deltas is None:
+        return None
+    delta = mx.array(cache_offset + rope_deltas)
+    if delta.ndim == 0:
+        delta = mx.expand_dims(delta, axis=0)
+    delta = delta.reshape(-1)[: input_ids.shape[0]]
+    if delta.shape[0] < input_ids.shape[0]:
+        delta = mx.tile(delta, (input_ids.shape[0],))[: input_ids.shape[0]]
+    positions = mx.arange(input_ids.shape[1]).reshape(1, -1)
+    positions = mx.add(positions, delta[:, None])[None, ...]
+    return mx.broadcast_to(positions, (3, input_ids.shape[0], input_ids.shape[1]))
+
+
+def _capture_boundary_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    kwargs = dict(payload["kwargs"])
+    position_ids = _position_ids_for_boundary(
+        model=payload["model"],
+        input_ids=payload["input_ids"],
+        prompt_cache=payload["prompt_cache"],
+        kwargs=kwargs,
+    )
+    rope_deltas = kwargs.get("rope_deltas", None)
+    if rope_deltas is None:
+        rope_deltas = getattr(
+            getattr(payload["model"], "language_model", None), "_rope_deltas", None
+        )
+    raw = {
+        "input_ids": payload["input_ids"],
+        "mask": payload["mask"],
+        "pixel_values": payload["pixel_values"],
+        "inputs_embeds": payload["inputs_embeds"],
+        "position_ids": position_ids,
+        "image_grid_thw": kwargs.get("image_grid_thw", None),
+        "rope_deltas": rope_deltas,
+        "prompt_cache": payload["prompt_cache"],
+    }
+    summary = {
+        "input_ids": array_summary(raw["input_ids"]),
+        "mask": array_summary(raw["mask"]),
+        "pixel_values": array_summary(raw["pixel_values"]),
+        "inputs_embeds": array_summary(raw["inputs_embeds"]),
+        "position_ids": array_summary(raw["position_ids"]),
+        "image_grid_thw": array_summary(raw["image_grid_thw"]),
+        "rope_deltas": array_summary(raw["rope_deltas"]),
+        "prompt_cache_bytes": cache_nbytes(raw["prompt_cache"]),
+        "prompt_cache_offsets": _cache_offsets(raw["prompt_cache"]),
+        "cached_image_features_present": kwargs.get("cached_image_features", None)
+        is not None,
+    }
+    return summary, raw
 
 
 def prompt_cache_state_metrics(state: PromptCacheState) -> Dict[str, int]:
@@ -810,6 +1054,208 @@ def run_image_prefix_boundary_only_parity(
     )
 
 
+def run_image_prefix_boundary_ledger(
+    *,
+    model_path: str,
+    image: Union[str, Sequence[str]],
+    prefix_prompt: str,
+    second_suffix: str,
+    top_k: int,
+    resize_shape: Optional[Union[int, Sequence[int]]] = None,
+    trust_remote_code: bool = False,
+    processor_kwargs: Optional[Dict[str, Any]] = None,
+    parity_order: str = "cold-first",
+) -> CacheReuseBoundaryLedgerReport:
+    images = _as_list(image)
+    model, processor = load(model_path, trust_remote_code=trust_remote_code)
+    config = _config_dict(model)
+    num_images = len(images or [])
+    first_prompt = apply_chat_template(
+        processor, config, prefix_prompt, num_images=num_images
+    )
+    first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        first_prompt,
+        image=images,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    second_inputs = append_suffix_tokens_to_inputs(first_inputs, suffix_tokens)
+    first_ids = first_inputs["input_ids"].flatten().tolist()
+    second_ids = second_inputs["input_ids"].flatten().tolist()
+    image_token_id = _image_token_id(model)
+
+    initial_state = PromptCacheState()
+    generate(
+        model,
+        processor,
+        "",
+        image=None,
+        max_tokens=1,
+        resize_shape=resize_shape,
+        prompt_cache_state=initial_state,
+        **generation_kwargs_from_inputs(first_inputs),
+    )
+    if initial_state.boundary_cache is None or initial_state.boundary_token_ids is None:
+        raise RuntimeError("Prompt cache state did not capture a prompt boundary.")
+
+    state = PromptCacheState()
+    state.update(initial_state.boundary_token_ids, initial_state.boundary_cache)
+    plan = inspect_prompt_reuse(state, second_ids)
+
+    cold_boundary: Dict[str, Any] = {}
+    reused_boundary: Dict[str, Any] = {}
+    cold_raw: Dict[str, Any] = {}
+    reused_raw: Dict[str, Any] = {}
+    cold_prefix_cache: List[Any] = []
+
+    def capture_cold_boundary(payload: Dict[str, Any]) -> None:
+        nonlocal cold_boundary, cold_raw
+        cold_boundary, cold_raw = _capture_boundary_payload(payload)
+
+    def capture_reused_boundary(payload: Dict[str, Any]) -> None:
+        nonlocal reused_boundary, reused_raw
+        reused_boundary, reused_raw = _capture_boundary_payload(payload)
+
+    def capture_cold_prefix_cache(prefix_len: int, prompt_cache: List[Any]) -> None:
+        nonlocal cold_prefix_cache
+        cold_prefix_cache = make_prompt_cache_boundary(prompt_cache)
+
+    cold_kwargs = generation_kwargs_from_inputs(second_inputs)
+    cold_kwargs["prompt_boundary_ledger_callback"] = capture_cold_boundary
+    cold_kwargs["prompt_cache_checkpoint"] = capture_cold_prefix_cache
+    cold_kwargs["prompt_cache_checkpoint_len"] = plan.reused_tokens
+    reused_kwargs = generation_kwargs_from_inputs(second_inputs)
+    reused_kwargs["prompt_boundary_ledger_callback"] = capture_reused_boundary
+    reused_kwargs["prompt_cache_state"] = state
+    recovered_prefix_cache = state.recover_prefix_cache(plan.reused_tokens)
+
+    if parity_order == "cold-first":
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **cold_kwargs,
+        )
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **reused_kwargs,
+        )
+    elif parity_order == "reused-first":
+        reused_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **reused_kwargs,
+        )
+        cold_result = generate(
+            model,
+            processor,
+            "",
+            image=None,
+            max_tokens=1,
+            resize_shape=resize_shape,
+            **cold_kwargs,
+        )
+    else:
+        raise ValueError(f"Unsupported parity order: {parity_order}")
+
+    if not cold_boundary or not reused_boundary:
+        raise RuntimeError("Boundary ledger callback did not capture both paths.")
+
+    cold_suffix = {
+        "input_ids": cold_raw["input_ids"][:, plan.reused_tokens :],
+        "mask": (
+            cold_raw["mask"][:, plan.reused_tokens :]
+            if cold_raw["mask"] is not None
+            else None
+        ),
+        "inputs_embeds": cold_raw["inputs_embeds"][:, plan.reused_tokens :, :],
+        "position_ids": (
+            cold_raw["position_ids"][:, :, plan.reused_tokens :]
+            if cold_raw["position_ids"] is not None
+            else None
+        ),
+    }
+    prefix_cache_comparison = cache_state_comparison(
+        cold_prefix_cache,
+        initial_state.boundary_cache,
+    )
+    restored_cache_comparison = cache_state_comparison(
+        initial_state.boundary_cache,
+        recovered_prefix_cache,
+    )
+    comparisons = {
+        "full_mask": array_comparison(cold_raw["mask"], reused_raw["mask"]),
+        "suffix_input_ids": array_comparison(
+            cold_suffix["input_ids"], reused_raw["input_ids"]
+        ),
+        "trimmed_suffix_mask_vs_reused_full_mask": array_comparison(
+            cold_suffix["mask"], reused_raw["mask"]
+        ),
+        "suffix_inputs_embeds": array_comparison(
+            cold_suffix["inputs_embeds"], reused_raw["inputs_embeds"]
+        ),
+        "suffix_position_ids": array_comparison(
+            cold_suffix["position_ids"], reused_raw["position_ids"]
+        ),
+        "image_grid_thw": array_comparison(
+            cold_raw["image_grid_thw"], reused_raw["image_grid_thw"]
+        ),
+        "rope_deltas": array_comparison(
+            cold_raw["rope_deltas"], reused_raw["rope_deltas"]
+        ),
+        "cold_prefix_cache_vs_first_boundary_cache": prefix_cache_comparison,
+        "first_boundary_cache_vs_recovered_cache": restored_cache_comparison,
+    }
+
+    cold_token = _token_value(cold_result.token)
+    reused_token = _token_value(reused_result.token)
+    return CacheReuseBoundaryLedgerReport(
+        scenario=f"image_prefix_boundary_ledger_{parity_order}",
+        model=model_path,
+        image=images,
+        top_k=top_k,
+        prompt_tokens=plan.prompt_tokens,
+        reused_tokens=plan.reused_tokens,
+        image_token_id=image_token_id,
+        image_token_in_prompt=(
+            image_token_id is not None and image_token_id in first_ids
+        ),
+        image_token_in_suffix=(
+            image_token_id is not None and image_token_id in suffix_tokens
+        ),
+        used_boundary_restore=plan.used_boundary_restore,
+        unsafe_rewind_refused=plan.unsafe_rewind_refused,
+        generated_tail_removed=plan.generated_tail_removed,
+        recoverable=plan.recoverable,
+        cold_token=cold_token,
+        reused_token=reused_token,
+        tokens_match=cold_token == reused_token,
+        parity=compare_topk_logprobs(cold_result.logprobs, reused_result.logprobs, top_k),
+        ledger={
+            "cold_boundary": cold_boundary,
+            "reused_boundary": reused_boundary,
+            "cold_suffix": {k: array_summary(v) for k, v in cold_suffix.items()},
+            "comparisons": comparisons,
+        },
+    )
+
+
 def run_text_prefix_boundary_only_parity(
     *,
     model_path: str,
@@ -1083,6 +1529,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "image-multiturn",
             "image-prefix-parity",
             "image-prefix-boundary-only-parity",
+            "image-prefix-boundary-ledger",
             "image-multiturn-parity",
             "text-prefix-boundary-only-parity",
         ],
@@ -1122,6 +1569,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "image-multiturn": run_image_multiturn_smoke,
         "image-prefix-parity": run_image_prefix_parity,
         "image-prefix-boundary-only-parity": run_image_prefix_boundary_only_parity,
+        "image-prefix-boundary-ledger": run_image_prefix_boundary_ledger,
         "image-multiturn-parity": run_image_multiturn_parity,
         "text-prefix-boundary-only-parity": run_text_prefix_boundary_only_parity,
     }
@@ -1137,7 +1585,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         trust_remote_code=args.trust_remote_code,
         processor_kwargs=args.processor_kwargs,
     )
-    if args.scenario.endswith("-parity"):
+    if args.scenario.endswith("-parity") or args.scenario.endswith("-ledger"):
         report = run_smoke(
             top_k=args.top_k, parity_order=args.parity_order, **common_kwargs
         )

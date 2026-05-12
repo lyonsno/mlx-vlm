@@ -8,7 +8,9 @@ from mlx_vlm.cache_reuse_smoke import (
     PromptReusePlan,
     append_suffix_tokens_to_cached_turn_inputs,
     append_suffix_tokens_to_inputs,
+    array_comparison,
     cache_nbytes,
+    cache_state_comparison,
     compare_topk_logprobs,
     inspect_prompt_reuse,
     parse_args,
@@ -207,6 +209,44 @@ def test_parse_args_allows_text_boundary_parity_without_image():
     assert args.scenario == "text-prefix-boundary-only-parity"
     assert args.image is None
     assert args.parity_order == "reused-first"
+
+
+def test_parse_args_exposes_image_boundary_ledger_scenario():
+    args = parse_args(
+        [
+            "--model",
+            "model",
+            "--image",
+            "image.png",
+            "--scenario",
+            "image-prefix-boundary-ledger",
+            "--parity-order",
+            "reused-first",
+        ]
+    )
+
+    assert args.scenario == "image-prefix-boundary-ledger"
+    assert args.parity_order == "reused-first"
+
+
+def test_boundary_ledger_comparisons_report_exactness_and_delta():
+    cold = mx.array([[1.0, 2.0, 3.0]])
+    reused = mx.array([[1.0, 2.5, 3.0]])
+
+    comparison = array_comparison(cold, reused)
+
+    assert comparison["shape_match"] is True
+    assert comparison["exact_match"] is False
+    assert comparison["max_abs_delta"] == 0.5
+
+    cold_cache = _mixed_cache(prefix_len=2)
+    reused_cache = make_prompt_cache_boundary(cold_cache)
+
+    cache_comparison = cache_state_comparison(cold_cache, reused_cache)
+
+    assert cache_comparison["array_count_match"] is True
+    assert cache_comparison["exact_match"] is True
+    assert cache_comparison["max_abs_delta"] == 0.0
 
 
 def test_smoke_report_json_preserves_answer_bank_fields():

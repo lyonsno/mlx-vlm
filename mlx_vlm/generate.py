@@ -1171,6 +1171,7 @@ def generate_step(
     prompt_cache_checkpoint: Optional[Callable[[int, List[Any]], None]] = None,
     prompt_cache_checkpoint_len: Optional[int] = None,
     prompt_cache_boundary_callback: Optional[Callable[[List[Any]], None]] = None,
+    prompt_boundary_ledger_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     **kwargs,
 ) -> Generator[Tuple[mx.array, mx.array], None, None]:
     """
@@ -1329,6 +1330,19 @@ def generate_step(
                 if k != "inputs_embeds" and v is not None
             }
         )
+        if prompt_boundary_ledger_callback is not None:
+            mx.eval(inputs_embeds)
+            prompt_boundary_ledger_callback(
+                {
+                    "input_ids": input_ids,
+                    "pixel_values": pixel_values,
+                    "mask": mask,
+                    "inputs_embeds": inputs_embeds,
+                    "prompt_cache": prompt_cache,
+                    "kwargs": dict(kwargs),
+                    "model": model,
+                }
+            )
         if getattr(model, "no_chunked_prefill", False):
             prefill_step_size = None
         checkpoint_len = (
@@ -1553,6 +1567,11 @@ def stream_generate(
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
     apc_manager: Optional[_apc.APCManager] = kwargs.pop("apc_manager", None)
     apc_tenant: Optional[str] = kwargs.pop("apc_tenant", None)
+    external_prompt_cache_checkpoint = kwargs.pop("prompt_cache_checkpoint", None)
+    external_prompt_cache_checkpoint_len = kwargs.pop("prompt_cache_checkpoint_len", None)
+    prompt_boundary_ledger_callback = kwargs.pop(
+        "prompt_boundary_ledger_callback", None
+    )
 
     if kwargs.get("input_ids", None) is not None:
         input_ids = kwargs.pop("input_ids")
@@ -1787,14 +1806,37 @@ def stream_generate(
                     extra_hash=apc_extra_hash,
                 )
 
+        prompt_cache_checkpoint = exact_checkpoint
+        prompt_cache_checkpoint_len = exact_checkpoint_len
+        if external_prompt_cache_checkpoint is not None:
+            if (
+                prompt_cache_checkpoint is not None
+                and prompt_cache_checkpoint_len != external_prompt_cache_checkpoint_len
+            ):
+                raise ValueError(
+                    "Cannot combine prompt cache checkpoints with different lengths."
+                )
+            if prompt_cache_checkpoint is None:
+                prompt_cache_checkpoint = external_prompt_cache_checkpoint
+                prompt_cache_checkpoint_len = external_prompt_cache_checkpoint_len
+            else:
+                chained_checkpoint = prompt_cache_checkpoint
+
+                def prompt_cache_checkpoint(
+                    prefix_len: int, prompt_cache: List[Any]
+                ) -> None:
+                    chained_checkpoint(prefix_len, prompt_cache)
+                    external_prompt_cache_checkpoint(prefix_len, prompt_cache)
+
         gen = generate_step(
             input_ids,
             model,
             pixel_values,
             mask,
-            prompt_cache_checkpoint=exact_checkpoint,
-            prompt_cache_checkpoint_len=exact_checkpoint_len,
+            prompt_cache_checkpoint=prompt_cache_checkpoint,
+            prompt_cache_checkpoint_len=prompt_cache_checkpoint_len,
             prompt_cache_boundary_callback=prompt_cache_boundary,
+            prompt_boundary_ledger_callback=prompt_boundary_ledger_callback,
             **kwargs,
         )
         tic = time.perf_counter()
