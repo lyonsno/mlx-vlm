@@ -312,6 +312,21 @@ def test_boundary_ledger_classifier_flags_mrope_or_cache_mismatch():
     assert classification["live_confirmation_required"] is False
 
 
+def test_boundary_ledger_classifier_distinguishes_argmax_drift():
+    payload = _boundary_ledger_report_payload()
+    payload["reused_token"] = 198
+    payload["tokens_match"] = False
+    payload["parity"]["argmax_token_id_match"] = False
+
+    classification = classify_boundary_ledger_report(payload)
+
+    assert classification["boundary_payload_exact"] is True
+    assert classification["argmax_stable"] is False
+    assert classification["distribution_exact"] is False
+    assert classification["classification"] == "exact_boundary_payload_argmax_drift"
+    assert classification["live_confirmation_required"] is True
+
+
 def test_smoke_report_json_preserves_answer_bank_fields():
     report = CacheReuseSmokeReport(
         scenario="image_prefix_diverged_suffix",

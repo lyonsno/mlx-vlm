@@ -274,6 +274,8 @@ def classify_boundary_ledger_report(report: Dict[str, Any]) -> Dict[str, Any]:
     boundary_payload_exact = len(failed_invariants) == 0
     if not boundary_payload_exact:
         classification = "boundary_payload_mismatch"
+    elif not argmax_stable:
+        classification = "exact_boundary_payload_argmax_drift"
     elif distribution_exact:
         classification = "exact_boundary_payload_distribution_exact"
     else:
