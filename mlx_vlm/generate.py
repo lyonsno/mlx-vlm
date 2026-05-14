@@ -2119,7 +2119,56 @@ _SEQUENCE_ALIGNED_PROMPT_KWARGS = {
     "pos_hw",
 }
 
-APC_PRIVATE_PROMPT_KEYS = ("_apc_tenant", "_apc_image_hash")
+IMAGE_PREFIX_CACHE_REUSE_MARKER_KEY = "_cache_reuse_live_marker"
+IMAGE_PREFIX_CACHE_REUSE_EXACT_CLASSIFICATIONS = {
+    "exact_boundary_payload_argmax_drift",
+    "exact_boundary_payload_distribution_exact",
+    "exact_boundary_payload_distribution_drift",
+}
+
+APC_PRIVATE_PROMPT_KEYS = (
+    "_apc_tenant",
+    "_apc_image_hash",
+    IMAGE_PREFIX_CACHE_REUSE_MARKER_KEY,
+)
+
+
+def _cache_reuse_marker(
+    mode: str,
+    reused_tokens: int,
+    *,
+    classification: Optional[Dict[str, Any]] = None,
+    fallback_reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    return {
+        "mode": mode,
+        "reused_tokens": int(reused_tokens),
+        "classification": dict(classification) if classification else None,
+        "fallback_reason": fallback_reason,
+    }
+
+
+def _image_prefix_reuse_classification(
+    prompt_kwargs: Optional[dict],
+) -> Optional[Dict[str, Any]]:
+    marker = (prompt_kwargs or {}).get(IMAGE_PREFIX_CACHE_REUSE_MARKER_KEY)
+    if not isinstance(marker, dict):
+        return None
+    return dict(marker)
+
+
+def _image_prefix_reuse_allowed(
+    prompt_kwargs: Optional[dict],
+) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+    classification = _image_prefix_reuse_classification(prompt_kwargs)
+    if classification is None:
+        return False, "image_prefix_contract_missing", None
+    if classification.get("boundary_payload_exact") is not True:
+        return False, "image_prefix_boundary_payload_mismatch", classification
+    name = classification.get("classification")
+    if name not in IMAGE_PREFIX_CACHE_REUSE_EXACT_CLASSIFICATIONS:
+        return False, "image_prefix_contract_unsupported", classification
+    return True, None, classification
 
 
 def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
@@ -2361,6 +2410,10 @@ class PromptProgress:
     prompt_tokens: int
     prompt_tps: float = 0.0
     prompt_time: float = 0.0
+    reused_tokens: int = 0
+    reuse_mode: str = "cold_prefill"
+    reuse_classification: Optional[Dict[str, Any]] = None
+    reuse_fallback_reason: Optional[str] = None
 
 
 class GenerationBatch:
@@ -2697,6 +2750,7 @@ class PromptProcessingBatch:
         right_pad_per_row: Optional[List[int]] = None,
         suffix_lens: Optional[List[int]] = None,
         apc_mode: Optional[str] = None,
+        reuse_markers: Optional[List[Dict[str, Any]]] = None,
     ):
         self.model = model
         self.uids = uids
@@ -2752,6 +2806,20 @@ class PromptProcessingBatch:
         self._apc_meta = apc_meta or []
         self._apc_manager = apc_manager
         self._apc_mode = apc_mode
+        if reuse_markers is None:
+            reuse_markers = []
+            for idx, meta in enumerate(self._apc_meta):
+                if meta is not None and meta.get("reuse_marker") is not None:
+                    reuse_markers.append(meta["reuse_marker"])
+                else:
+                    prefix_len = int((meta or {}).get("prefix_len", 0) or 0)
+                    mode = "cold_prefill" if prefix_len == 0 else "apc"
+                    reuse_markers.append(
+                        _cache_reuse_marker(mode, prefix_len)
+                    )
+            while len(reuse_markers) < len(uids):
+                reuse_markers.append(_cache_reuse_marker("cold_prefill", 0))
+        self._reuse_markers = list(reuse_markers)
         self._apc_harvest_enabled = True
         self._prompt_time_s = 0.0
         self._prompt_tokens_per_row: List[int] = []
@@ -2934,9 +3002,15 @@ class PromptProcessingBatch:
                 prompt_tokens=prompt_tokens,
                 prompt_tps=prompt_tokens / self._prompt_time_s,
                 prompt_time=self._prompt_time_s,
+                reused_tokens=int(marker.get("reused_tokens", 0) or 0),
+                reuse_mode=marker.get("mode", "cold_prefill"),
+                reuse_classification=marker.get("classification"),
+                reuse_fallback_reason=marker.get("fallback_reason"),
             )
-            for uid, prompt_tokens in zip(
-                self._prompt_uids, self._prompt_tokens_per_row
+            for uid, prompt_tokens, marker in zip(
+                self._prompt_uids,
+                self._prompt_tokens_per_row,
+                self._reuse_markers,
             )
         ]
 
@@ -3222,6 +3296,7 @@ class BatchGenerator:
         self._prompt_time_counter = 0
         self._gen_tokens_counter = 0
         self._steps_counter = 0
+        self._cache_reuse_fallbacks: Dict[int, Dict[str, Any]] = {}
 
         self._wire_stack = contextlib.ExitStack()
         self._wire_stack.enter_context(wired_limit(model, [self._stream]))
@@ -3244,6 +3319,51 @@ class BatchGenerator:
         tenant = prompt_kwargs.get("_apc_tenant")
         return _apc.tenant_scoped_hash(tenant, img)
 
+    def _record_cache_reuse_fallback(
+        self,
+        uid: int,
+        reason: str,
+        *,
+        classification: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        marker = _cache_reuse_marker(
+            "cold_prefill",
+            0,
+            classification=classification,
+            fallback_reason=reason,
+        )
+        if not hasattr(self, "_cache_reuse_fallbacks"):
+            self._cache_reuse_fallbacks = {}
+        self._cache_reuse_fallbacks[uid] = marker
+        return marker
+
+    def _validate_image_prefix_reuse(
+        self,
+        uid: int,
+        ids_list: List[int],
+        prefix_len: int,
+        prompt_kwargs: Optional[dict],
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        config = getattr(self.model, "config", None)
+        image_token_id = getattr(config, "image_token_id", None) or getattr(
+            config, "image_token_index", None
+        )
+        if (
+            image_token_id is None
+            or prefix_len <= 0
+            or image_token_id not in ids_list[:prefix_len]
+        ):
+            return True, None
+        ok, reason, classification = _image_prefix_reuse_allowed(prompt_kwargs)
+        if ok:
+            return True, classification
+        self._record_cache_reuse_fallback(
+            uid,
+            reason or "image_prefix_contract_unsupported",
+            classification=classification,
+        )
+        return False, classification
+
     def _apc_pick_for(self, sequence) -> Optional[dict]:
         """Look up an APC prefix for ``sequence``. Returns dict with matched
         blocks + suffix metadata when there is a usable hit, else None.
@@ -3253,11 +3373,6 @@ class BatchGenerator:
         uid, ids_list, max_toks, prompt_kwargs, lps = sequence
         if not ids_list or len(ids_list) < 2:
             return None
-        # v1/v2: don't trim a prefix that contains image tokens — re-running
-        # vision merging on the suffix is the cheap path here.
-        image_token_id = getattr(self.model.config, "image_token_id", None) or getattr(
-            self.model.config, "image_token_index", None
-        )
         extra_hash = self._apc_extra_hash(prompt_kwargs or {})
         apc_mode = getattr(self, "apc_mode", "block")
         if apc_mode == "exact":
@@ -3270,10 +3385,10 @@ class BatchGenerator:
                 and exact_prefix_len > 0
                 and exact_prefix_len < len(ids_list)
             ):
-                if (
-                    image_token_id is not None
-                    and image_token_id in ids_list[:exact_prefix_len]
-                ):
+                ok, classification = self._validate_image_prefix_reuse(
+                    uid, ids_list, exact_prefix_len, prompt_kwargs
+                )
+                if not ok:
                     return None
                 return {
                     "matched_blocks": [],
@@ -3281,6 +3396,11 @@ class BatchGenerator:
                     "prefix_len": exact_prefix_len,
                     "extra_hash": extra_hash,
                     "full_input_ids": list(ids_list),
+                    "reuse_marker": _cache_reuse_marker(
+                        "apc_exact",
+                        exact_prefix_len,
+                        classification=classification,
+                    ),
                 }
             return None
         matched, prefix_len = self.apc_manager.lookup_prefix(
@@ -3308,10 +3428,10 @@ class BatchGenerator:
         ) and disk_prefix_len < len(ids_list):
             if matched:
                 self.apc_manager.release(matched)
-            if (
-                image_token_id is not None
-                and image_token_id in ids_list[:disk_prefix_len]
-            ):
+            ok, classification = self._validate_image_prefix_reuse(
+                uid, ids_list, disk_prefix_len, prompt_kwargs
+            )
+            if not ok:
                 return None
             return {
                 "matched_blocks": [],
@@ -3319,14 +3439,19 @@ class BatchGenerator:
                 "prefix_len": disk_prefix_len,
                 "extra_hash": extra_hash,
                 "full_input_ids": list(ids_list),
+                "reuse_marker": _cache_reuse_marker(
+                    "apc_disk",
+                    disk_prefix_len,
+                    classification=classification,
+                ),
             }
         if exact_prefix_len > prefix_len and exact_prefix_len < len(ids_list):
             if matched:
                 self.apc_manager.release(matched)
-            if (
-                image_token_id is not None
-                and image_token_id in ids_list[:exact_prefix_len]
-            ):
+            ok, classification = self._validate_image_prefix_reuse(
+                uid, ids_list, exact_prefix_len, prompt_kwargs
+            )
+            if not ok:
                 return None
             return {
                 "matched_blocks": [],
@@ -3334,9 +3459,17 @@ class BatchGenerator:
                 "prefix_len": exact_prefix_len,
                 "extra_hash": extra_hash,
                 "full_input_ids": list(ids_list),
+                "reuse_marker": _cache_reuse_marker(
+                    "apc_exact",
+                    exact_prefix_len,
+                    classification=classification,
+                ),
             }
         if prefix_len > 0 and prefix_len < len(ids_list):
-            if image_token_id is not None and image_token_id in ids_list[:prefix_len]:
+            ok, classification = self._validate_image_prefix_reuse(
+                uid, ids_list, prefix_len, prompt_kwargs
+            )
+            if not ok:
                 self.apc_manager.release(matched)
                 return None
             return {
@@ -3344,6 +3477,11 @@ class BatchGenerator:
                 "prefix_len": prefix_len,
                 "extra_hash": extra_hash,
                 "full_input_ids": list(ids_list),
+                "reuse_marker": _cache_reuse_marker(
+                    "apc_block",
+                    prefix_len,
+                    classification=classification,
+                ),
             }
         if matched:
             self.apc_manager.release(matched)
@@ -3380,6 +3518,17 @@ class BatchGenerator:
         prefix_lens = [p["prefix_len"] if p else 0 for p in picks]
         suffix_ids_list = [full_ids[i][prefix_lens[i] :] for i in range(len(sequences))]
         suffix_lens = [len(s) for s in suffix_ids_list]
+        reuse_markers = []
+        for i, pick in enumerate(picks):
+            if pick is not None and pick.get("reuse_marker") is not None:
+                reuse_markers.append(dict(pick["reuse_marker"]))
+            else:
+                fallback = getattr(self, "_cache_reuse_fallbacks", {}).get(uids[i])
+                reuse_markers.append(
+                    dict(fallback)
+                    if fallback is not None
+                    else _cache_reuse_marker("cold_prefill", 0)
+                )
 
         max_suffix_len = max(suffix_lens)
         right_pad_per_row = [max_suffix_len - s for s in suffix_lens]
@@ -3466,6 +3615,7 @@ class BatchGenerator:
                     else self._apc_extra_hash(prompt_kwargs_list[i] or {})
                 ),
                 "apc_blocks": picks[i].get("matched_blocks", []) if picks[i] else [],
+                "reuse_marker": reuse_markers[i],
                 "checkpoint_len": (
                     max(
                         1,
@@ -3496,12 +3646,14 @@ class BatchGenerator:
             right_pad_per_row=right_pad_per_row,
             suffix_lens=suffix_lens,
             apc_mode=apc_mode,
+            reuse_markers=reuse_markers,
         )
 
     def _build_apc_meta_for_cold(
         self,
         input_ids_list: List[List[int]],
         prompt_kwargs_list: List[Optional[dict]],
+        uids: Optional[List[int]] = None,
     ) -> Optional[List[Optional[dict]]]:
         """Build per-row harvest metadata for a cold-prefill batch so the
         produced K/V are added to APC after prefill.
@@ -3509,14 +3661,25 @@ class BatchGenerator:
         if self.apc_manager is None:
             return None
         meta: List[Optional[dict]] = []
-        for ids_list, kw in zip(input_ids_list, prompt_kwargs_list):
+        for idx, (ids_list, kw) in enumerate(zip(input_ids_list, prompt_kwargs_list)):
             extra_hash = self._apc_extra_hash(kw or {})
+            uid = uids[idx] if uids is not None else None
+            fallback = (
+                getattr(self, "_cache_reuse_fallbacks", {}).get(uid)
+                if uid is not None
+                else None
+            )
             meta.append(
                 {
                     "full_input_ids": list(ids_list),
                     "prefix_len": 0,
                     "extra_hash": extra_hash,
                     "apc_blocks": [],
+                    "reuse_marker": (
+                        dict(fallback)
+                        if fallback is not None
+                        else _cache_reuse_marker("cold_prefill", 0)
+                    ),
                     "checkpoint_len": (
                         max(
                             1,
@@ -3742,7 +3905,9 @@ class BatchGenerator:
             )
 
             # APC: also harvest cold-prefill prefixes so future requests hit.
-            apc_meta = self._build_apc_meta_for_cold(input_ids, prompt_kwargs_list)
+            apc_meta = self._build_apc_meta_for_cold(
+                input_ids, prompt_kwargs_list, uids
+            )
 
             self._prompt_batch = PromptProcessingBatch(
                 model=self.model,

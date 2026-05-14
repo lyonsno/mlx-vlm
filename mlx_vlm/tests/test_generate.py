@@ -25,6 +25,7 @@ from mlx_vlm.generate import (
     GenerationBatch,
     GenerationResult,
     PromptCacheState,
+    PromptProcessingBatch,
     _left_pad_prompts,
     _prime_cached_prefix_rope_state,
     generate_step,
@@ -1693,7 +1694,242 @@ def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     assert captured["prompt_kwargs"]["keep_tensor"].shape == (2, 1)
 
 
-def test_apc_pick_rejects_image_tokens_and_releases_blocks():
+def test_prompt_progress_reports_request_local_reuse_markers():
+    batch = PromptProcessingBatch(
+        model=SimpleNamespace(layers=[object()]),
+        uids=[101, 202],
+        input_ids=[[7, 8], [9]],
+        max_tokens=[1, 1],
+        inputs_embeds=mx.ones((2, 2, 3)),
+        prompt_kwargs={},
+        prefill_step_size=None,
+        apc_meta=[
+            {
+                "full_input_ids": [99, 1, 7, 8],
+                "prefix_len": 2,
+                "reuse_marker": {
+                    "mode": "apc_exact",
+                    "reused_tokens": 2,
+                    "classification": {
+                        "classification": "exact_boundary_payload_distribution_drift",
+                        "boundary_payload_exact": True,
+                        "live_confirmation_required": True,
+                    },
+                    "fallback_reason": None,
+                },
+            },
+            {
+                "full_input_ids": [9],
+                "prefix_len": 0,
+                "reuse_marker": {
+                    "mode": "cold_prefill",
+                    "reused_tokens": 0,
+                    "classification": None,
+                    "fallback_reason": None,
+                },
+            },
+        ],
+    )
+    batch.record_prompt_time(0.5)
+
+    progress = {row.uid: row for row in batch.prompt_progress()}
+
+    assert progress[101].prompt_tokens == 4
+    assert progress[101].reused_tokens == 2
+    assert progress[101].reuse_mode == "apc_exact"
+    assert progress[101].reuse_classification["classification"] == (
+        "exact_boundary_payload_distribution_drift"
+    )
+    assert progress[101].reuse_fallback_reason is None
+    assert progress[202].prompt_tokens == 1
+    assert progress[202].reused_tokens == 0
+    assert progress[202].reuse_mode == "cold_prefill"
+
+
+def test_mixed_apc_batch_records_per_request_reuse_for_divergent_suffixes():
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = SimpleNamespace(exact_cache_guard_tokens=1)
+    bg.apc_mode = "block"
+    bg.model = SimpleNamespace(layers=[object()], config=SimpleNamespace())
+    bg.prefill_step_size = None
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg._wire_stack = None
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(**kwargs)
+
+    sequences = [
+        (
+            10,
+            [99, 1, 2, 3, 50, 51],
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 6, 4)),
+                "_apc_image_hash": 111,
+                "_cache_reuse_live_marker": {
+                    "classification": "exact_boundary_payload_distribution_drift",
+                    "boundary_payload_exact": True,
+                    "live_confirmation_required": True,
+                },
+            },
+            [],
+        ),
+        (
+            20,
+            [4, 5, 6, 60],
+            1,
+            {"inputs_embeds": mx.ones((1, 4, 4)) * 2, "_apc_image_hash": 222},
+            [],
+        ),
+        (
+            30,
+            [7, 8, 70, 71, 72],
+            1,
+            {"inputs_embeds": mx.ones((1, 5, 4)) * 3, "_apc_image_hash": 333},
+            [],
+        ),
+    ]
+    picks = [
+        {
+            "matched_blocks": [],
+            "prefix_len": 4,
+            "extra_hash": 11,
+            "full_input_ids": list(sequences[0][1]),
+            "reuse_marker": {
+                "mode": "apc_block",
+                "reused_tokens": 4,
+                "classification": sequences[0][3]["_cache_reuse_live_marker"],
+                "fallback_reason": None,
+            },
+        },
+        {
+            "matched_blocks": [],
+            "prefix_len": 2,
+            "extra_hash": 22,
+            "full_input_ids": list(sequences[1][1]),
+            "reuse_marker": {
+                "mode": "apc_block",
+                "reused_tokens": 2,
+                "classification": None,
+                "fallback_reason": None,
+            },
+        },
+        None,
+    ]
+
+    with (
+        patch.object(BatchGenerator, "_apc_pick_for", side_effect=picks),
+        patch.object(
+            generate_module._apc,
+            "make_warm_batch_kv_cache_multi",
+            return_value=([], 4),
+        ),
+        patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch),
+    ):
+        batch = bg._build_mixed_prompt_batch(sequences)
+
+    assert batch is not None
+    assert captured["input_ids"] == [[50, 51], [6, 60], [7, 8, 70, 71, 72]]
+    assert captured["suffix_lens"] == [2, 2, 5]
+    assert captured["right_pad_per_row"] == [3, 3, 0]
+    assert [m["reused_tokens"] for m in captured["reuse_markers"]] == [4, 2, 0]
+    assert [m["mode"] for m in captured["reuse_markers"]] == [
+        "apc_block",
+        "apc_block",
+        "cold_prefill",
+    ]
+    assert captured["reuse_markers"][0]["classification"]["classification"] == (
+        "exact_boundary_payload_distribution_drift"
+    )
+    assert captured["reuse_markers"][2]["classification"] is None
+
+
+def test_apc_pick_allows_exact_cache_for_classified_image_prefix():
+    image_token_id = 99
+
+    class ExactManager:
+        def lookup_exact_cache(self, ids_list, *, extra_hash=0, min_prefix_tokens=0):
+            assert ids_list == [image_token_id, 1, 2, 3]
+            return ["warm-cache"], 3
+
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = ExactManager()
+    bg.apc_mode = "exact"
+    bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
+    bg._wire_stack = None
+
+    pick = bg._apc_pick_for(
+        (
+            42,
+            [image_token_id, 1, 2, 3],
+            1,
+            {
+                "_cache_reuse_live_marker": {
+                    "classification": "exact_boundary_payload_distribution_drift",
+                    "boundary_payload_exact": True,
+                    "live_confirmation_required": True,
+                }
+            },
+            [],
+        )
+    )
+
+    assert pick is not None
+    assert pick["prefix_len"] == 3
+    assert pick["warm_cache"] == ["warm-cache"]
+    assert pick["reuse_marker"]["mode"] == "apc_exact"
+    assert pick["reuse_marker"]["reused_tokens"] == 3
+    assert pick["reuse_marker"]["classification"]["classification"] == (
+        "exact_boundary_payload_distribution_drift"
+    )
+
+
+def test_apc_pick_records_unsafe_image_prefix_fallback_locally():
+    image_token_id = 99
+
+    class ExactManager:
+        def lookup_exact_cache(self, ids_list, *, extra_hash=0, min_prefix_tokens=0):
+            return ["warm-cache"], 2
+
+    bg = object.__new__(BatchGenerator)
+    bg.apc_manager = ExactManager()
+    bg.apc_mode = "exact"
+    bg.model = SimpleNamespace(config=SimpleNamespace(image_token_id=image_token_id))
+    bg._wire_stack = None
+
+    pick = bg._apc_pick_for(
+        (
+            7,
+            [image_token_id, 1, 2, 3],
+            1,
+            {
+                "_cache_reuse_live_marker": {
+                    "classification": "boundary_payload_mismatch",
+                    "boundary_payload_exact": False,
+                    "live_confirmation_required": False,
+                }
+            },
+            [],
+        )
+    )
+
+    assert pick is None
+    assert bg._cache_reuse_fallbacks[7]["reused_tokens"] == 0
+    assert bg._cache_reuse_fallbacks[7]["mode"] == "cold_prefill"
+    assert bg._cache_reuse_fallbacks[7]["fallback_reason"] == (
+        "image_prefix_boundary_payload_mismatch"
+    )
+    assert bg._cache_reuse_fallbacks[7]["classification"]["classification"] == (
+        "boundary_payload_mismatch"
+    )
+
+
+def test_apc_pick_rejects_unclassified_image_tokens_and_releases_blocks():
     block_size = 4
     image_token_id = 99
     token_ids = [image_token_id, 1, 2, 3, 4]
