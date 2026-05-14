@@ -4,6 +4,7 @@ import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
 
 from mlx_vlm.cache_reuse_smoke import (
+    BOUNDARY_LEDGER_EXACT_INVARIANTS,
     CacheReuseSmokeReport,
     PromptReusePlan,
     append_suffix_tokens_to_cached_turn_inputs,
@@ -11,6 +12,7 @@ from mlx_vlm.cache_reuse_smoke import (
     array_comparison,
     cache_nbytes,
     cache_state_comparison,
+    classify_boundary_ledger_report,
     compare_topk_logprobs,
     inspect_prompt_reuse,
     parse_args,
@@ -247,6 +249,67 @@ def test_boundary_ledger_comparisons_report_exactness_and_delta():
     assert cache_comparison["array_count_match"] is True
     assert cache_comparison["exact_match"] is True
     assert cache_comparison["max_abs_delta"] == 0.0
+
+
+def _exact_comparison():
+    return {"exact_match": True, "shape_match": True, "max_abs_delta": 0.0}
+
+
+def _boundary_ledger_report_payload():
+    comparisons = {
+        name: _exact_comparison()
+        for name in BOUNDARY_LEDGER_EXACT_INVARIANTS
+    }
+    comparisons["trimmed_suffix_mask_vs_reused_full_mask"] = {
+        "exact_match": False,
+        "shape_match": False,
+        "cold_shape": [1, 9],
+        "reused_shape": [1, 326],
+        "max_abs_delta": None,
+    }
+    return {
+        "scenario": "image_prefix_boundary_ledger_reused-first",
+        "cold_token": 248046,
+        "reused_token": 248046,
+        "tokens_match": True,
+        "parity": {
+            "argmax_token_id_match": True,
+            "argmax_abs_logprob_delta": 0.0,
+            "topk_token_ids_match": False,
+            "max_abs_logprob_delta": 0.75,
+        },
+        "ledger": {"comparisons": comparisons},
+    }
+
+
+def test_boundary_ledger_classifier_preserves_exact_payload_with_distribution_drift():
+    classification = classify_boundary_ledger_report(_boundary_ledger_report_payload())
+
+    assert classification["boundary_payload_exact"] is True
+    assert classification["failed_boundary_invariants"] == []
+    assert classification["expected_shape_mismatches"] == [
+        "trimmed_suffix_mask_vs_reused_full_mask"
+    ]
+    assert classification["argmax_stable"] is True
+    assert classification["distribution_exact"] is False
+    assert classification["classification"] == "exact_boundary_payload_distribution_drift"
+    assert classification["live_confirmation_required"] is True
+
+
+def test_boundary_ledger_classifier_flags_mrope_or_cache_mismatch():
+    payload = _boundary_ledger_report_payload()
+    payload["ledger"]["comparisons"]["suffix_position_ids"] = {
+        "exact_match": False,
+        "shape_match": True,
+        "max_abs_delta": 1.0,
+    }
+
+    classification = classify_boundary_ledger_report(payload)
+
+    assert classification["boundary_payload_exact"] is False
+    assert classification["failed_boundary_invariants"] == ["suffix_position_ids"]
+    assert classification["classification"] == "boundary_payload_mismatch"
+    assert classification["live_confirmation_required"] is False
 
 
 def test_smoke_report_json_preserves_answer_bank_fields():

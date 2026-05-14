@@ -107,6 +107,22 @@ class CacheReuseBoundaryLedgerReport:
         return asdict(self)
 
 
+BOUNDARY_LEDGER_EXACT_INVARIANTS = (
+    "suffix_input_ids",
+    "full_mask",
+    "suffix_inputs_embeds",
+    "suffix_position_ids",
+    "image_grid_thw",
+    "rope_deltas",
+    "cold_prefix_cache_vs_first_boundary_cache",
+    "first_boundary_cache_vs_recovered_cache",
+)
+
+EXPECTED_BOUNDARY_LEDGER_SHAPE_MISMATCHES = (
+    "trimmed_suffix_mask_vs_reused_full_mask",
+)
+
+
 def cache_nbytes(value: Any) -> int:
     if value is None:
         return 0
@@ -229,6 +245,49 @@ def cache_state_comparison(cold_cache: Any, reused_cache: Any) -> Dict[str, Any]
         "exact_match": exact_match,
         "max_abs_delta": max(deltas, default=None),
         "entries": comparisons,
+    }
+
+
+def classify_boundary_ledger_report(report: Dict[str, Any]) -> Dict[str, Any]:
+    """Summarize whether a boundary ledger found payload mismatch or drift only."""
+    comparisons = report.get("ledger", {}).get("comparisons", {})
+    failed_invariants = [
+        name
+        for name in BOUNDARY_LEDGER_EXACT_INVARIANTS
+        if not comparisons.get(name, {}).get("exact_match", False)
+    ]
+    expected_shape_mismatches = [
+        name
+        for name in EXPECTED_BOUNDARY_LEDGER_SHAPE_MISMATCHES
+        if name in comparisons
+        and not comparisons.get(name, {}).get("shape_match", True)
+    ]
+    parity = report.get("parity", {})
+    argmax_stable = bool(report.get("tokens_match", False)) and bool(
+        parity.get("argmax_token_id_match", False)
+    )
+    distribution_exact = (
+        argmax_stable
+        and bool(parity.get("topk_token_ids_match", False))
+        and parity.get("max_abs_logprob_delta", None) == 0.0
+    )
+    boundary_payload_exact = len(failed_invariants) == 0
+    if not boundary_payload_exact:
+        classification = "boundary_payload_mismatch"
+    elif distribution_exact:
+        classification = "exact_boundary_payload_distribution_exact"
+    else:
+        classification = "exact_boundary_payload_distribution_drift"
+    return {
+        "boundary_payload_exact": boundary_payload_exact,
+        "failed_boundary_invariants": failed_invariants,
+        "expected_shape_mismatches": expected_shape_mismatches,
+        "argmax_stable": argmax_stable,
+        "distribution_exact": distribution_exact,
+        "classification": classification,
+        "live_confirmation_required": (
+            boundary_payload_exact and not distribution_exact
+        ),
     }
 
 
@@ -1225,6 +1284,20 @@ def run_image_prefix_boundary_ledger(
 
     cold_token = _token_value(cold_result.token)
     reused_token = _token_value(reused_result.token)
+    parity = compare_topk_logprobs(cold_result.logprobs, reused_result.logprobs, top_k)
+    ledger = {
+        "cold_boundary": cold_boundary,
+        "reused_boundary": reused_boundary,
+        "cold_suffix": {k: array_summary(v) for k, v in cold_suffix.items()},
+        "comparisons": comparisons,
+    }
+    ledger["classification"] = classify_boundary_ledger_report(
+        {
+            "tokens_match": cold_token == reused_token,
+            "parity": parity,
+            "ledger": ledger,
+        }
+    )
     return CacheReuseBoundaryLedgerReport(
         scenario=f"image_prefix_boundary_ledger_{parity_order}",
         model=model_path,
@@ -1246,13 +1319,8 @@ def run_image_prefix_boundary_ledger(
         cold_token=cold_token,
         reused_token=reused_token,
         tokens_match=cold_token == reused_token,
-        parity=compare_topk_logprobs(cold_result.logprobs, reused_result.logprobs, top_k),
-        ledger={
-            "cold_boundary": cold_boundary,
-            "reused_boundary": reused_boundary,
-            "cold_suffix": {k: array_summary(v) for k, v in cold_suffix.items()},
-            "comparisons": comparisons,
-        },
+        parity=parity,
+        ledger=ledger,
     )
 
 
