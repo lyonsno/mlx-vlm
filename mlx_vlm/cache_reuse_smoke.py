@@ -9,7 +9,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import mlx.core as mx
 from mlx_lm.models.cache import make_prompt_cache_boundary
 
-from .generate import PromptCacheState, generate, normalize_resize_shape
+from . import apc as _apc
+from .generate import BatchGenerator, PromptCacheState, generate, normalize_resize_shape
 from .prompt_utils import apply_chat_template
 from .utils import load, prepare_inputs
 
@@ -102,6 +103,29 @@ class CacheReuseBoundaryLedgerReport:
     tokens_match: bool
     parity: Dict[str, Any]
     ledger: Dict[str, Any]
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class BatchCacheReuseSmokeReport:
+    scenario: str
+    model: str
+    image: Optional[List[str]]
+    image_token_id: Optional[int]
+    first_prompt_tokens: List[int]
+    second_prompt_tokens: List[int]
+    prompt_progress: List[Dict[str, Any]]
+    generated_token_counts: Dict[str, int]
+    generated_texts: Dict[str, str]
+    image_reuse_mode: str
+    image_reused_tokens: int
+    image_reuse_classification: Optional[Dict[str, Any]]
+    text_reuse_mode: str
+    text_reused_tokens: int
+    apc_mode: Optional[str]
+    peak_memory_bytes: Optional[int]
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -612,6 +636,113 @@ def generation_kwargs_from_inputs(inputs: Dict[str, Any]) -> Dict[str, Any]:
     return kwargs
 
 
+def batch_generator_prompt_kwargs(
+    model: Any,
+    inputs: Dict[str, Any],
+    *,
+    apc_image_hash: Optional[int] = None,
+    cache_reuse_live_marker: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    data_kwargs = {
+        k: v
+        for k, v in inputs.items()
+        if k not in ["input_ids", "pixel_values", "attention_mask"]
+    }
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        if hasattr(language_model, "_position_ids"):
+            language_model._position_ids = None
+        if hasattr(language_model, "_rope_deltas"):
+            language_model._rope_deltas = None
+    embedding_output = model.get_input_embeddings(
+        inputs["input_ids"],
+        inputs.get("pixel_values", None),
+        mask=inputs.get("attention_mask", None),
+        **data_kwargs,
+    )
+    prompt_kwargs = {**data_kwargs, **embedding_output.to_dict()}
+    if language_model is not None:
+        position_ids = getattr(language_model, "_position_ids", None)
+        if (
+            position_ids is not None
+            and getattr(position_ids, "ndim", 0) >= 3
+            and position_ids.shape[-1] == inputs["input_ids"].shape[-1]
+        ):
+            prompt_kwargs["position_ids"] = position_ids
+        else:
+            token_positions = mx.arange(inputs["input_ids"].shape[-1], dtype=mx.int32)
+            token_positions = token_positions.reshape(1, 1, -1)
+            prompt_kwargs["position_ids"] = mx.broadcast_to(
+                token_positions,
+                (3, 1, inputs["input_ids"].shape[-1]),
+            )
+        rope_deltas = getattr(language_model, "_rope_deltas", None)
+        if rope_deltas is not None:
+            prompt_kwargs["rope_deltas"] = rope_deltas
+    if apc_image_hash is not None:
+        prompt_kwargs["_apc_image_hash"] = int(apc_image_hash)
+    if cache_reuse_live_marker is not None:
+        prompt_kwargs["_cache_reuse_live_marker"] = dict(cache_reuse_live_marker)
+    return prompt_kwargs
+
+
+def _decode_tokens(processor: Any, tokens: Sequence[int]) -> str:
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    detokenizer = getattr(processor, "detokenizer", None)
+    if detokenizer is not None:
+        detokenizer.reset()
+        for token in tokens:
+            detokenizer.add_token(int(token))
+        detokenizer.finalize()
+        return detokenizer.text
+    return tokenizer.decode(list(tokens))
+
+
+def run_batch_generator_to_completion(
+    *,
+    model: Any,
+    processor: Any,
+    input_ids: List[List[int]],
+    prompt_kwargs: List[Dict[str, Any]],
+    max_tokens: int,
+    apc_manager: "_apc.APCManager",
+) -> Tuple[List[Dict[str, Any]], Dict[int, List[int]], Optional[str]]:
+    language_model = getattr(model, "language_model", model)
+    if hasattr(language_model, "_position_ids"):
+        language_model._position_ids = None
+    if hasattr(language_model, "_rope_deltas"):
+        language_model._rope_deltas = None
+    generator = BatchGenerator(
+        language_model,
+        processor,
+        prefill_batch_size=len(input_ids),
+        completion_batch_size=len(input_ids),
+        compute_logprobs=False,
+        apc_manager=apc_manager,
+    )
+    uids = generator.insert(
+        input_ids,
+        [max_tokens] * len(input_ids),
+        prompt_kwargs=prompt_kwargs,
+    )
+    generated = {int(uid): [] for uid in uids}
+    prompt_progress: List[Dict[str, Any]] = []
+    try:
+        while generator.has_work:
+            prompt_responses, generation_responses = generator.next()
+            for response in prompt_responses:
+                row = asdict(response)
+                row["uid"] = int(row["uid"])
+                prompt_progress.append(row)
+            for response in generation_responses:
+                if response.finish_reason != "stop":
+                    generated[int(response.uid)].append(_token_value(response.token))
+        apc_mode = getattr(generator, "apc_mode", None)
+    finally:
+        generator.close()
+    return prompt_progress, generated, apc_mode
+
+
 def _image_state_contract(model: Any, prompt: str, plan: PromptReusePlan) -> str:
     image_token_id = getattr(getattr(model, "config", None), "image_token_id", None)
     image_token_id = image_token_id or getattr(
@@ -839,6 +970,159 @@ def run_image_multiturn_smoke(
         image_state_contract=_image_state_contract(model, second_suffix, plan),
         first_text=first_result.text,
         second_text=second_result.text,
+    )
+
+
+def run_image_prefix_batched_smoke(
+    *,
+    model_path: str,
+    image: Union[str, Sequence[str]],
+    prefix_prompt: str,
+    second_suffix: str,
+    max_tokens: int,
+    resize_shape: Optional[Union[int, Sequence[int]]] = None,
+    trust_remote_code: bool = False,
+    processor_kwargs: Optional[Dict[str, Any]] = None,
+) -> BatchCacheReuseSmokeReport:
+    images = _as_list(image)
+    model, processor = load(model_path, trust_remote_code=trust_remote_code)
+    config = _config_dict(model)
+    tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    image_token_id = _image_token_id(model)
+    apc_manager = _apc.APCManager()
+
+    image_first_prompt = apply_chat_template(
+        processor, config, prefix_prompt, num_images=len(images or [])
+    )
+    text_first_prompt = apply_chat_template(
+        processor,
+        config,
+        "State one short fact about cache reuse.",
+        num_images=0,
+    )
+    image_first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        image_first_prompt,
+        image=images,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    text_first_inputs = prepare_prompt_inputs(
+        model,
+        processor,
+        text_first_prompt,
+        image=None,
+        resize_shape=resize_shape,
+        processor_kwargs=processor_kwargs,
+    )
+    image_hash = _apc.hash_image_payload(
+        pixel_values=image_first_inputs.get("pixel_values"),
+        image_ref=images[0] if images else None,
+    )
+
+    first_input_ids = [
+        image_first_inputs["input_ids"].flatten().tolist(),
+        text_first_inputs["input_ids"].flatten().tolist(),
+    ]
+    first_prompt_kwargs = [
+        batch_generator_prompt_kwargs(
+            model,
+            image_first_inputs,
+            apc_image_hash=image_hash,
+        ),
+        batch_generator_prompt_kwargs(model, text_first_inputs),
+    ]
+
+    if hasattr(mx, "reset_peak_memory"):
+        mx.reset_peak_memory()
+    run_batch_generator_to_completion(
+        model=model,
+        processor=processor,
+        input_ids=first_input_ids,
+        prompt_kwargs=first_prompt_kwargs,
+        max_tokens=max_tokens,
+        apc_manager=apc_manager,
+    )
+
+    suffix_tokens = tokenizer.encode(second_suffix, add_special_tokens=False)
+    text_suffix_tokens = tokenizer.encode(
+        "\nNow answer with one different short fact.",
+        add_special_tokens=False,
+    )
+    image_second_inputs = append_suffix_tokens_to_inputs(
+        image_first_inputs,
+        suffix_tokens,
+    )
+    text_second_inputs = append_suffix_tokens_to_inputs(
+        text_first_inputs,
+        text_suffix_tokens,
+    )
+    image_marker = {
+        "classification": "exact_boundary_payload_distribution_drift",
+        "boundary_payload_exact": True,
+        "live_confirmation_required": True,
+        "source": "cash_money_image_prefix_boundary_ledger_contract",
+    }
+    second_input_ids = [
+        image_second_inputs["input_ids"].flatten().tolist(),
+        text_second_inputs["input_ids"].flatten().tolist(),
+    ]
+    second_prompt_kwargs = [
+        batch_generator_prompt_kwargs(
+            model,
+            image_second_inputs,
+            apc_image_hash=image_hash,
+            cache_reuse_live_marker=image_marker,
+        ),
+        batch_generator_prompt_kwargs(model, text_second_inputs),
+    ]
+    prompt_progress, generated, apc_mode = run_batch_generator_to_completion(
+        model=model,
+        processor=processor,
+        input_ids=second_input_ids,
+        prompt_kwargs=second_prompt_kwargs,
+        max_tokens=max_tokens,
+        apc_manager=apc_manager,
+    )
+    progress_by_uid = {int(row["uid"]): row for row in prompt_progress}
+    if 0 not in progress_by_uid or 1 not in progress_by_uid:
+        raise RuntimeError("Batched smoke did not report prompt progress for both rows.")
+    image_progress = progress_by_uid[0]
+    text_progress = progress_by_uid[1]
+    if image_progress.get("reused_tokens", 0) <= 0:
+        raise RuntimeError("Image row did not reuse cached prefix tokens.")
+    if text_progress.get("reused_tokens", 0) <= 0:
+        raise RuntimeError("Text row did not reuse cached prefix tokens.")
+    if image_progress.get("reuse_classification") is None:
+        raise RuntimeError("Image row did not preserve reuse classification marker.")
+
+    generated_texts = {
+        str(uid): _decode_tokens(processor, tokens)
+        for uid, tokens in sorted(generated.items())
+    }
+    peak_memory_bytes = (
+        int(mx.get_peak_memory()) if hasattr(mx, "get_peak_memory") else None
+    )
+    return BatchCacheReuseSmokeReport(
+        scenario="image_prefix_batched_cache_reuse",
+        model=model_path,
+        image=images,
+        image_token_id=image_token_id,
+        first_prompt_tokens=[len(ids) for ids in first_input_ids],
+        second_prompt_tokens=[len(ids) for ids in second_input_ids],
+        prompt_progress=prompt_progress,
+        generated_token_counts={
+            str(uid): len(tokens) for uid, tokens in sorted(generated.items())
+        },
+        generated_texts=generated_texts,
+        image_reuse_mode=str(image_progress.get("reuse_mode", "")),
+        image_reused_tokens=int(image_progress.get("reused_tokens", 0) or 0),
+        image_reuse_classification=image_progress.get("reuse_classification"),
+        text_reuse_mode=str(text_progress.get("reuse_mode", "")),
+        text_reused_tokens=int(text_progress.get("reused_tokens", 0) or 0),
+        apc_mode=apc_mode,
+        peak_memory_bytes=peak_memory_bytes,
     )
 
 
@@ -1596,6 +1880,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         "--scenario",
         choices=[
             "image-prefix",
+            "image-prefix-batched",
             "image-multiturn",
             "image-prefix-parity",
             "image-prefix-boundary-only-parity",
@@ -1636,6 +1921,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
     scenario_runners = {
         "image-prefix": run_image_prefix_smoke,
+        "image-prefix-batched": run_image_prefix_batched_smoke,
         "image-multiturn": run_image_multiturn_smoke,
         "image-prefix-parity": run_image_prefix_parity,
         "image-prefix-boundary-only-parity": run_image_prefix_boundary_only_parity,

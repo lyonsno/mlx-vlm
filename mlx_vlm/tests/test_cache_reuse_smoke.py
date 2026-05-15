@@ -5,6 +5,7 @@ from mlx_lm.models.cache import ArraysCache, KVCache, make_prompt_cache_boundary
 
 from mlx_vlm.cache_reuse_smoke import (
     BOUNDARY_LEDGER_EXACT_INVARIANTS,
+    BatchCacheReuseSmokeReport,
     CacheReuseSmokeReport,
     PromptReusePlan,
     append_suffix_tokens_to_cached_turn_inputs,
@@ -231,6 +232,22 @@ def test_parse_args_exposes_image_boundary_ledger_scenario():
     assert args.parity_order == "reused-first"
 
 
+def test_parse_args_exposes_image_prefix_batched_scenario():
+    args = parse_args(
+        [
+            "--model",
+            "model",
+            "--image",
+            "image.png",
+            "--scenario",
+            "image-prefix-batched",
+        ]
+    )
+
+    assert args.scenario == "image-prefix-batched"
+    assert args.image == ["image.png"]
+
+
 def test_boundary_ledger_comparisons_report_exactness_and_delta():
     cold = mx.array([[1.0, 2.0, 3.0]])
     reused = mx.array([[1.0, 2.5, 3.0]])
@@ -361,3 +378,61 @@ def test_smoke_report_json_preserves_answer_bank_fields():
     assert payload["image_token_in_suffix"] is False
     assert payload["used_boundary_restore"] is True
     assert payload["boundary_cache_bytes"] == 40
+
+
+def test_batched_smoke_report_json_preserves_reuse_markers():
+    report = BatchCacheReuseSmokeReport(
+        scenario="image_prefix_batched_cache_reuse",
+        model="local-model",
+        image=["image.png"],
+        image_token_id=151655,
+        first_prompt_tokens=[320, 12],
+        second_prompt_tokens=[328, 20],
+        prompt_progress=[
+            {
+                "uid": 0,
+                "prompt_tokens": 328,
+                "prompt_tps": 100.0,
+                "prompt_time": 3.28,
+                "reused_tokens": 320,
+                "reuse_mode": "apc_exact",
+                "reuse_classification": {
+                    "classification": "exact_boundary_payload_distribution_drift",
+                    "boundary_payload_exact": True,
+                    "live_confirmation_required": True,
+                },
+                "reuse_fallback_reason": None,
+            },
+            {
+                "uid": 1,
+                "prompt_tokens": 20,
+                "prompt_tps": 100.0,
+                "prompt_time": 0.2,
+                "reused_tokens": 12,
+                "reuse_mode": "apc_exact",
+                "reuse_classification": None,
+                "reuse_fallback_reason": None,
+            },
+        ],
+        generated_token_counts={"0": 2, "1": 2},
+        generated_texts={"0": "cat", "1": "cache"},
+        image_reuse_mode="apc_exact",
+        image_reused_tokens=320,
+        image_reuse_classification={
+            "classification": "exact_boundary_payload_distribution_drift",
+            "boundary_payload_exact": True,
+            "live_confirmation_required": True,
+        },
+        text_reuse_mode="apc_exact",
+        text_reused_tokens=12,
+        apc_mode="exact",
+        peak_memory_bytes=1024,
+    )
+
+    payload = report.to_dict()
+    encoded = json.dumps(payload, sort_keys=True)
+
+    assert json.loads(encoded)["scenario"] == "image_prefix_batched_cache_reuse"
+    assert payload["image_reused_tokens"] == 320
+    assert payload["text_reused_tokens"] == 12
+    assert payload["image_reuse_classification"]["boundary_payload_exact"] is True

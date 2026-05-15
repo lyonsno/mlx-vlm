@@ -1625,6 +1625,127 @@ def test_cold_batch_left_pads_sequence_aligned_prompt_kwargs():
     assert prompt_kwargs["per_layer_inputs"][3, :, 0, 0].tolist() == [0, 0, 0, 4]
 
 
+def test_cold_batch_left_pads_qwen_mrope_position_ids_on_sequence_axis():
+    class EmptyGenerationBatch:
+        def __len__(self):
+            return 0
+
+    bg = object.__new__(BatchGenerator)
+    bg._generation_batch = EmptyGenerationBatch()
+    bg._prompt_batch = None
+    bg._prompt_tokens_counter = 0
+    bg._prompt_time_counter = 0
+    bg._gen_tokens_counter = 0
+    bg._steps_counter = 0
+    bg.completion_batch_size = 2
+    bg.prefill_batch_size = 2
+    bg.prefill_step_size = None
+    bg.kv_bits = None
+    bg.kv_group_size = 64
+    bg.kv_quant_scheme = "affine"
+    bg.apc_manager = None
+    bg.apc_mode = None
+    bg.model = SimpleNamespace()
+    bg._wire_stack = None
+    bg.compute_logprobs = False
+    bg.top_logprobs_k = 0
+    bg.sampler = lambda logprobs: mx.argmax(logprobs, axis=-1)
+    bg.tokenizer = SimpleNamespace(stopping_criteria=object())
+
+    bg._unprocessed_sequences = [
+        (
+            0,
+            [10, 11, 12],
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 3, 4)),
+                "position_ids": mx.arange(9, dtype=mx.int32).reshape(3, 1, 3),
+            },
+            [],
+        ),
+        (
+            1,
+            [20, 21, 22, 23, 24],
+            1,
+            {
+                "inputs_embeds": mx.ones((1, 5, 4)) * 2,
+                "position_ids": mx.arange(15, dtype=mx.int32).reshape(3, 1, 5),
+            },
+            [],
+        ),
+    ]
+
+    captured = {}
+
+    def fake_prompt_batch(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            total_prompt_tokens=sum(len(ids) for ids in kwargs["input_ids"]),
+            needs_processing=lambda: True,
+            prompt_step=lambda: 0,
+        )
+
+    with patch.object(generate_module, "PromptProcessingBatch", fake_prompt_batch):
+        bg._next()
+
+    position_ids = captured["prompt_kwargs"]["position_ids"]
+    assert position_ids.shape == (3, 2, 5)
+    assert position_ids[:, 0, :].tolist() == [
+        [0, 0, 0, 1, 2],
+        [0, 0, 3, 4, 5],
+        [0, 0, 6, 7, 8],
+    ]
+    assert position_ids[:, 1, :].tolist() == [
+        [0, 1, 2, 3, 4],
+        [5, 6, 7, 8, 9],
+        [10, 11, 12, 13, 14],
+    ]
+
+
+def test_prompt_processing_batch_chunks_qwen_mrope_position_ids_on_sequence_axis():
+    calls = []
+
+    class PositionAwareModel:
+        layers = [object()]
+
+        def __call__(
+            self, input_ids, *, cache, inputs_embeds, n_to_process=None, **kwargs
+        ):
+            calls.append(kwargs["position_ids"])
+            for entry in cache:
+                entry.keys = mx.zeros((input_ids.shape[0], 1, n_to_process, 1))
+                entry.values = mx.zeros((input_ids.shape[0], 1, n_to_process, 1))
+                entry._idx = n_to_process
+
+    batch = PromptProcessingBatch(
+        model=PositionAwareModel(),
+        uids=[1, 2],
+        input_ids=[[1, 2, 3, 4], [5, 6, 7, 8]],
+        max_tokens=[1, 1],
+        inputs_embeds=mx.ones((2, 4, 3)),
+        prompt_kwargs={
+            "position_ids": mx.arange(24, dtype=mx.int32).reshape(3, 2, 4)
+        },
+        prefill_step_size=2,
+    )
+
+    processed = batch.prompt_step()
+
+    assert processed == 2
+    assert calls[0].shape == (3, 2, 2)
+    assert calls[0].tolist() == [
+        [[0, 1], [4, 5]],
+        [[8, 9], [12, 13]],
+        [[16, 17], [20, 21]],
+    ]
+    assert batch._prompt_kwargs["position_ids"].shape == (3, 2, 2)
+    assert batch._prompt_kwargs["position_ids"].tolist() == [
+        [[2, 3], [6, 7]],
+        [[10, 11], [14, 15]],
+        [[18, 19], [22, 23]],
+    ]
+
+
 def test_mixed_apc_batch_strips_private_kwargs_before_prefill():
     bg = object.__new__(BatchGenerator)
     bg.apc_manager = object()
@@ -1770,6 +1891,7 @@ def test_mixed_apc_batch_records_per_request_reuse_for_divergent_suffixes():
             1,
             {
                 "inputs_embeds": mx.ones((1, 6, 4)),
+                "position_ids": mx.arange(18, dtype=mx.int32).reshape(3, 1, 6),
                 "_apc_image_hash": 111,
                 "_cache_reuse_live_marker": {
                     "classification": "exact_boundary_payload_distribution_drift",
@@ -1783,14 +1905,22 @@ def test_mixed_apc_batch_records_per_request_reuse_for_divergent_suffixes():
             20,
             [4, 5, 6, 60],
             1,
-            {"inputs_embeds": mx.ones((1, 4, 4)) * 2, "_apc_image_hash": 222},
+            {
+                "inputs_embeds": mx.ones((1, 4, 4)) * 2,
+                "position_ids": mx.arange(12, dtype=mx.int32).reshape(3, 1, 4),
+                "_apc_image_hash": 222,
+            },
             [],
         ),
         (
             30,
             [7, 8, 70, 71, 72],
             1,
-            {"inputs_embeds": mx.ones((1, 5, 4)) * 3, "_apc_image_hash": 333},
+            {
+                "inputs_embeds": mx.ones((1, 5, 4)) * 3,
+                "position_ids": mx.arange(15, dtype=mx.int32).reshape(3, 1, 5),
+                "_apc_image_hash": 333,
+            },
             [],
         ),
     ]
@@ -1837,6 +1967,7 @@ def test_mixed_apc_batch_records_per_request_reuse_for_divergent_suffixes():
     assert captured["input_ids"] == [[50, 51], [6, 60], [7, 8, 70, 71, 72]]
     assert captured["suffix_lens"] == [2, 2, 5]
     assert captured["right_pad_per_row"] == [3, 3, 0]
+    assert captured["prompt_kwargs"]["position_ids"].shape == (3, 3, 5)
     assert [m["reused_tokens"] for m in captured["reuse_markers"]] == [4, 2, 0]
     assert [m["mode"] for m in captured["reuse_markers"]] == [
         "apc_block",

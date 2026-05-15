@@ -2172,6 +2172,10 @@ def _image_prefix_reuse_allowed(
 
 
 def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
+    if v.ndim >= 3 and v.shape[0] == 3 and v.shape[1] == batch_size:
+        return v[:, row_idx : row_idx + 1, ...]
+    if v.ndim >= 3 and v.shape[0] == 3 and v.shape[1] == 1:
+        return v
     if v.shape[0] == batch_size:
         return v[row_idx : row_idx + 1]
     return v[:1]
@@ -2203,6 +2207,8 @@ def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[d
 def _is_sequence_aligned_prompt_kwarg(
     key: str, v: mx.array, sequence_length: int
 ) -> bool:
+    if key == "position_ids" and v.ndim >= 3 and v.shape[0] == 3:
+        return v.shape[2] == sequence_length
     return (
         key in _SEQUENCE_ALIGNED_PROMPT_KWARGS
         and v.ndim >= 2
@@ -2210,16 +2216,46 @@ def _is_sequence_aligned_prompt_kwarg(
     )
 
 
+def _sequence_aligned_prompt_len(key: str, v: mx.array) -> Optional[int]:
+    if key == "position_ids" and v.ndim >= 3 and v.shape[0] == 3:
+        return int(v.shape[2])
+    if key in _SEQUENCE_ALIGNED_PROMPT_KWARGS and v.ndim >= 2:
+        return int(v.shape[1])
+    return None
+
+
 def _pad_sequence_aligned_prompt_kwarg(
     v: mx.array, target_length: int, *, left: bool
 ) -> mx.array:
-    pad = target_length - v.shape[1]
+    seq_axis = 2 if v.ndim >= 3 and v.shape[0] == 3 else 1
+    pad = target_length - v.shape[seq_axis]
     if pad <= 0:
         return v
-    pad_shape = (v.shape[0], pad) + tuple(v.shape[2:])
+    pad_shape = list(v.shape)
+    pad_shape[seq_axis] = pad
     pad_v = mx.zeros(pad_shape, dtype=v.dtype)
     parts = [pad_v, v] if left else [v, pad_v]
-    return mx.concatenate(parts, axis=1)
+    return mx.concatenate(parts, axis=seq_axis)
+
+
+def _slice_sequence_aligned_prompt_kwarg(
+    v: mx.array, start: Optional[int] = None, stop: Optional[int] = None
+) -> mx.array:
+    seq_axis = 2 if v.ndim >= 3 and v.shape[0] == 3 else 1
+    slices = [slice(None)] * v.ndim
+    slices[seq_axis] = slice(start, stop)
+    return v[tuple(slices)]
+
+
+def _concat_prompt_kwarg_rows(key: str, values: List[mx.array]) -> mx.array:
+    if (
+        key == "position_ids"
+        and values
+        and values[0].ndim >= 3
+        and values[0].shape[0] == 3
+    ):
+        return mx.concatenate(values, axis=1)
+    return mx.concatenate(values, axis=0)
 
 
 def _merge_prefill_prompt_kwargs(
@@ -2267,7 +2303,7 @@ def _merge_prefill_prompt_kwargs(
             elif k not in merged_kwargs:
                 merged_kwargs[k] = v
     for k, vs in per_row_keys.items():
-        merged_kwargs[k] = mx.concatenate(vs, axis=0)
+        merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
     return inputs_embeds, merged_kwargs
 
@@ -2794,12 +2830,16 @@ class PromptProcessingBatch:
             prompt_batch = self._inputs_embeds.shape[0]
             prompt_len = self._inputs_embeds.shape[1]
             for k, v in self._prompt_kwargs.items():
-                if (
-                    isinstance(v, mx.array)
-                    and v.ndim >= 2
-                    and v.shape[0] == prompt_batch
-                    and v.shape[1] == prompt_len
-                ):
+                if not isinstance(v, mx.array):
+                    continue
+                seq_len = _sequence_aligned_prompt_len(k, v)
+                if seq_len != prompt_len:
+                    continue
+                if k == "position_ids" and v.ndim >= 3 and v.shape[0] == 3:
+                    if v.shape[1] == prompt_batch:
+                        self._prompt_length_aware_keys.append(k)
+                    continue
+                if v.ndim >= 2 and v.shape[0] == prompt_batch:
                     self._prompt_length_aware_keys.append(k)
 
         # APC metadata used for post-prefill block harvest (per-row).
@@ -2957,7 +2997,7 @@ class PromptProcessingBatch:
             return self._prompt_kwargs
         out = dict(self._prompt_kwargs)
         for k in self._prompt_length_aware_keys:
-            out[k] = out[k][:, :n, ...]
+            out[k] = _slice_sequence_aligned_prompt_kwarg(out[k], None, n)
         return out
 
     def prompt_step(self) -> int:
@@ -2986,7 +3026,9 @@ class PromptProcessingBatch:
         self._inputs_embeds = self._inputs_embeds[:, n:]
         self._input_ids = self._input_ids[:, n:]
         for k in self._prompt_length_aware_keys:
-            self._prompt_kwargs[k] = self._prompt_kwargs[k][:, n:, ...]
+            self._prompt_kwargs[k] = _slice_sequence_aligned_prompt_kwarg(
+                self._prompt_kwargs[k], n, None
+            )
         mx.clear_cache()
         return n
 
@@ -3570,7 +3612,9 @@ class BatchGenerator:
                 if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
                     row_v = _prompt_kwarg_row(v, i, batch_size)
                     if _is_sequence_aligned_prompt_kwarg(k, row_v, full_len):
-                        row_v = row_v[:, prefix_len:, ...]
+                        row_v = _slice_sequence_aligned_prompt_kwarg(
+                            row_v, prefix_len, None
+                        )
                         row_v = _pad_sequence_aligned_prompt_kwarg(
                             row_v,
                             max_suffix_len,
@@ -3580,7 +3624,7 @@ class BatchGenerator:
                 elif k not in merged_kwargs:
                     merged_kwargs[k] = v
         for k, vs in per_row_keys.items():
-            merged_kwargs[k] = mx.concatenate(vs, axis=0)
+            merged_kwargs[k] = _concat_prompt_kwarg_rows(k, vs)
 
         apc_mode = getattr(self, "apc_mode", "block")
         if apc_mode == "exact":
