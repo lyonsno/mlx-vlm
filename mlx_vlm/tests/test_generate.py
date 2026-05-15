@@ -917,6 +917,79 @@ class TestBatchGenerate:
                     max_tokens=5,
                 )
 
+    def test_generate_batch_keeps_ordinary_3d_prompt_kwargs_batch_first(
+        self, mock_model, mock_processor
+    ):
+        class _EmbeddingOutput:
+            def __init__(self, inputs_embeds, ordinary_3d):
+                self.inputs_embeds = inputs_embeds
+                self.ordinary_3d = ordinary_3d
+
+            def to_dict(self):
+                return {
+                    "inputs_embeds": self.inputs_embeds,
+                    "ordinary_3d": self.ordinary_3d,
+                }
+
+        class _StopInsert(Exception):
+            pass
+
+        batch_size = 3
+        seq_len = 3
+        hidden_size = 2
+        input_ids = mx.array(
+            [
+                [11, 12, 13],
+                [21, 22, 23],
+                [31, 32, 33],
+            ],
+            dtype=mx.int32,
+        )
+        inputs_embeds = mx.arange(
+            batch_size * seq_len * hidden_size, dtype=mx.float32
+        ).reshape(batch_size, seq_len, hidden_size)
+        ordinary_3d = inputs_embeds + 100
+        embedding_output = _EmbeddingOutput(inputs_embeds, ordinary_3d)
+
+        def fake_insert(
+            self, prompts, max_tokens, prompt_kwargs=None, logits_processors=None
+        ):
+            assert len(prompts) == batch_size
+            assert len(prompt_kwargs) == batch_size
+            for i, kw in enumerate(prompt_kwargs):
+                assert kw["inputs_embeds"].shape == (1, seq_len, hidden_size)
+                assert kw["ordinary_3d"].shape == (1, seq_len, hidden_size)
+                assert kw["inputs_embeds"].tolist() == inputs_embeds[i : i + 1].tolist()
+                assert kw["ordinary_3d"].tolist() == ordinary_3d[i : i + 1].tolist()
+            raise _StopInsert
+
+        with (
+            patch.object(
+                generate_module,
+                "apply_chat_template",
+                side_effect=lambda processor, config, prompt, num_images=0: prompt,
+            ),
+            patch.object(
+                generate_module,
+                "prepare_inputs",
+                return_value={
+                    "input_ids": input_ids,
+                    "attention_mask": mx.ones((batch_size, seq_len), dtype=mx.int32),
+                },
+            ),
+            patch.object(
+                mock_model, "get_input_embeddings", return_value=embedding_output
+            ),
+            patch.object(generate_module.BatchGenerator, "insert", new=fake_insert),
+        ):
+            with pytest.raises(_StopInsert):
+                generate_module._generate_batch(
+                    mock_model,
+                    mock_processor,
+                    prompts=["alpha", "beta", "gamma"],
+                    max_tokens=5,
+                )
+
     @patch.object(generate_module, "_generate_batch")
     @patch("mlx_vlm.utils.process_image")
     def test_with_images_same_shape(

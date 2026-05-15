@@ -2171,10 +2171,16 @@ def _image_prefix_reuse_allowed(
     return True, None, classification
 
 
-def _prompt_kwarg_row(v: mx.array, row_idx: int, batch_size: int) -> mx.array:
-    if v.ndim >= 3 and v.shape[0] == 3 and v.shape[1] == batch_size:
+def _is_mrope_position_ids(key: str, v: mx.array) -> bool:
+    return key == "position_ids" and v.ndim >= 3 and v.shape[0] == 3
+
+
+def _prompt_kwarg_row(
+    key: str, v: mx.array, row_idx: int, batch_size: int
+) -> mx.array:
+    if _is_mrope_position_ids(key, v) and v.shape[1] == batch_size:
         return v[:, row_idx : row_idx + 1, ...]
-    if v.ndim >= 3 and v.shape[0] == 3 and v.shape[1] == 1:
+    if _is_mrope_position_ids(key, v) and v.shape[1] == 1:
         return v
     if v.shape[0] == batch_size:
         return v[row_idx : row_idx + 1]
@@ -2197,7 +2203,7 @@ def _split_prompt_kwargs_per_row(prompt_kwargs: dict, batch_size: int) -> List[d
     for k, v in (prompt_kwargs or {}).items():
         if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
             for i in range(batch_size):
-                rows[i][k] = _prompt_kwarg_row(v, i, batch_size)
+                rows[i][k] = _prompt_kwarg_row(k, v, i, batch_size)
         else:
             for row in rows:
                 row[k] = v
@@ -2294,7 +2300,7 @@ def _merge_prefill_prompt_kwargs(
             if k == "inputs_embeds" or k in APC_PRIVATE_PROMPT_KEYS:
                 continue
             if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                row_v = _prompt_kwarg_row(v, i, batch_size)
+                row_v = _prompt_kwarg_row(k, v, i, batch_size)
                 if _is_sequence_aligned_prompt_kwarg(k, row_v, length):
                     row_v = _pad_sequence_aligned_prompt_kwarg(
                         row_v, max_length, left=True
@@ -3610,7 +3616,7 @@ class BatchGenerator:
                 if k == "inputs_embeds" or k in self._APC_PRIVATE_KEYS:
                     continue
                 if isinstance(v, mx.array) and v.ndim > 0 and v.shape[0] >= 1:
-                    row_v = _prompt_kwarg_row(v, i, batch_size)
+                    row_v = _prompt_kwarg_row(k, v, i, batch_size)
                     if _is_sequence_aligned_prompt_kwarg(k, row_v, full_len):
                         row_v = _slice_sequence_aligned_prompt_kwarg(
                             row_v, prefix_len, None
