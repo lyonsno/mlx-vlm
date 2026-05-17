@@ -144,3 +144,23 @@ def test_run_server_cache_reuse_smoke_drives_first_party_endpoints():
     ]
     assert report["receipt"]["apc_reuse_observed"] is True
     assert report["receipt"]["image_payload_observed_by_server"] is True
+
+
+def test_run_server_cache_reuse_smoke_defaults_warm_question_to_cold_question():
+    client = FakeHTTPClient()
+    config = ServerCacheReuseSmokeConfig(
+        base_url="http://server.test",
+        model="demo-model",
+        image_url="file:///tmp/counter.png",
+        prefix="Shared exact APC prefix. ",
+        cold_question="What is visible?",
+        warm_question=None,
+        max_tokens=2,
+    )
+
+    run_server_cache_reuse_smoke(config, client=client)
+
+    chat_posts = [post for post in client.posts if post[0] == "/v1/chat/completions"]
+    cold_text = chat_posts[0][1]["messages"][0]["content"][0]["text"]
+    warm_text = chat_posts[1][1]["messages"][0]["content"][0]["text"]
+    assert cold_text == warm_text

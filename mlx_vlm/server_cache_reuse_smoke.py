@@ -27,9 +27,7 @@ class ServerCacheReuseSmokeConfig:
     tenant: Optional[str] = "cash-register-proof-heist"
     reset_cache: bool = True
     cold_question: str = "Describe the visible scene in one short sentence."
-    warm_question: str = (
-        "Using the same image and shared context, name one visible object."
-    )
+    warm_question: Optional[str] = None
     timeout: float = 600.0
 
 
@@ -64,6 +62,10 @@ def _shared_prefix(config: ServerCacheReuseSmokeConfig) -> str:
         return config.prefix
     repetitions = max(1, int(config.prefix_repetitions))
     return DEFAULT_PREFIX_SENTENCE * repetitions
+
+
+def _warm_question(config: ServerCacheReuseSmokeConfig) -> str:
+    return config.warm_question or config.cold_question
 
 
 def build_chat_payload(
@@ -220,7 +222,7 @@ def run_server_cache_reuse_smoke(
         model=config.model,
         image_url=config.image_url,
         prefix=prefix,
-        question=config.warm_question,
+        question=_warm_question(config),
         max_tokens=config.max_tokens,
     )
 
@@ -299,6 +301,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--prefix-repetitions", type=int, default=64)
     parser.add_argument("--max-tokens", type=int, default=8)
     parser.add_argument("--tenant", default="cash-register-proof-heist")
+    parser.add_argument(
+        "--cold-question",
+        default="Describe the visible scene in one short sentence.",
+        help="Question used for the cold request.",
+    )
+    parser.add_argument(
+        "--warm-question",
+        default=None,
+        help=(
+            "Question used for the warm request. Defaults to the cold question "
+            "so exact APC modes can prove an identical repeated request."
+        ),
+    )
     parser.add_argument("--no-reset-cache", action="store_true")
     parser.add_argument("--timeout", type=float, default=600.0)
     parser.add_argument("--output", type=Path, default=None)
@@ -316,6 +331,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_tokens=args.max_tokens,
         tenant=args.tenant,
         reset_cache=not args.no_reset_cache,
+        cold_question=args.cold_question,
+        warm_question=args.warm_question,
         timeout=args.timeout,
     )
     report = run_server_cache_reuse_smoke(config)
