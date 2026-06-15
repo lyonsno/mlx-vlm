@@ -1,19 +1,20 @@
-"""Streaming TTS output interface + Voxtral backend.
+"""TTS backends for gemma4 audio loop.
 
-Architecture: VoxtralTTSPlayer accumulates text while the LM generates, then
-synthesizes on the main thread in flush() — MLX Metal streams are thread-local
-and cannot safely be used from background threads.
-
-Sequence:
-    tts = VoxtralTTSPlayer()
+All backends share StreamingTTSPlayer interface:
+    tts = <Backend>TTSPlayer(...)
     for text in run_inference(...):
         tts.play_chunk(text)   # buffers text, no-op until flush
-    tts.flush()                # synthesize on main thread + play via AudioPlayer
+    tts.flush()                # synthesize + play on calling (main) thread
     tts.close()
 
-Future candidates:
-  - VoxCPM2 (OpenBMB, 48kHz, tier-1): mlx_audio.tts.models.voxcpm already present
-  - VibeVoice-Realtime (0.5B, 300ms): mlx_audio.tts.models.vibevoice present
+MLX Metal streams are thread-local — synthesis must run on the same thread
+that holds the GPU context (the main thread). Do not call flush() from a
+background thread.
+
+Backends
+--------
+VoxtralTTSPlayer  — Voxtral-4B-TTS, 24kHz, streaming chunks (low perceived latency)
+VoxCPMTTSPlayer   — VoxCPM1.5, 44.1kHz, batch decode (higher quality, no streaming)
 """
 
 import numpy as np
@@ -124,4 +125,83 @@ class VoxtralTTSPlayer(StreamingTTSPlayer):
             except Exception:
                 pass
             self._player = None
+        self._model = None
+
+
+# ---------------------------------------------------------------------------
+# VoxCPM backend
+# ---------------------------------------------------------------------------
+
+DEFAULT_VOXCPM_MODEL = "mlx-community/VoxCPM1.5"
+
+
+class VoxCPMTTSPlayer(StreamingTTSPlayer):
+    """TTS via VoxCPM1.5 on MLX.
+
+    VoxCPM generates the entire utterance in one batch decode (no streaming),
+    then plays it via sounddevice. Quality is tier-1 at 44.1kHz; latency is
+    higher than Voxtral because there are no intermediate audio chunks.
+
+    Supports zero-shot synthesis (text only) and voice cloning
+    (ref_audio + ref_text). Voice cloning requires a reference WAV file.
+    """
+
+    def __init__(
+        self,
+        model_path: str = DEFAULT_VOXCPM_MODEL,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
+        inference_timesteps: int = 10,
+        cfg_value: float = 2.0,
+    ):
+        super().__init__(voice="default", sample_rate=44_100)
+        self._model_path = model_path
+        self._ref_audio = ref_audio
+        self._ref_text = ref_text
+        self._inference_timesteps = inference_timesteps
+        self._cfg_value = cfg_value
+        self._model = None
+        self._text_buf = ""
+
+    def _ensure_loaded(self):
+        if self._model is not None:
+            return
+        print(f"[tts] Loading VoxCPM from {self._model_path}...")
+        import time
+        t0 = time.time()
+        from mlx_audio.tts.utils import load as load_tts
+        self._model = load_tts(self._model_path)
+        self.sample_rate = self._model.sample_rate
+        print(f"[tts] VoxCPM loaded in {time.time()-t0:.1f}s  "
+              f"(sample_rate={self._model.sample_rate})")
+
+    def play_chunk(self, text: str) -> None:
+        """Buffer text delta — synthesis happens in flush() on the main thread."""
+        self._text_buf += text
+
+    def flush(self) -> None:
+        """Synthesize buffered text and play via sounddevice."""
+        text = self._text_buf.strip()
+        self._text_buf = ""
+        if not text:
+            return
+        self._ensure_loaded()
+        print(f"[tts] Synthesizing {len(text)} chars (VoxCPM)...")
+        try:
+            import sounddevice as sd
+            for result in self._model.generate(
+                text=text,
+                ref_audio=self._ref_audio,
+                ref_text=self._ref_text,
+                inference_timesteps=self._inference_timesteps,
+                cfg_value=self._cfg_value,
+            ):
+                audio_np = np.array(result.audio, dtype=np.float32)
+                if audio_np.size > 0:
+                    sd.play(audio_np, samplerate=result.sample_rate)
+                    sd.wait()
+        except Exception as e:
+            print(f"[tts] synthesis error: {e}")
+
+    def close(self) -> None:
         self._model = None

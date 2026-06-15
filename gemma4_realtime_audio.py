@@ -37,7 +37,9 @@ from mlx_vlm.tools.gemma4_audio.audio import load_audio_file, record_mic
 from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
 from mlx_vlm.tools.gemma4_audio.inference import run_inference
 from mlx_vlm.tools.gemma4_audio.tts import (
+    DEFAULT_VOXCPM_MODEL,
     DEFAULT_VOXTRAL_MODEL,
+    VoxCPMTTSPlayer,
     VoxtralTTSPlayer,
 )
 
@@ -55,11 +57,18 @@ def main():
     parser.add_argument("--warmup", action="store_true",
                         help="Run a silent warmup pass to pre-compile Metal kernels")
     parser.add_argument("--tts", action="store_true",
-                        help="Speak the response via Voxtral TTS")
-    parser.add_argument("--tts-model", default=DEFAULT_VOXTRAL_MODEL,
-                        help="Voxtral TTS model path or HF repo")
+                        help="Speak the response via TTS")
+    parser.add_argument("--tts-backend", default="voxtral",
+                        choices=["voxtral", "voxcpm"],
+                        help="TTS backend: voxtral (streaming, 24kHz) or voxcpm (batch, 44.1kHz)")
+    parser.add_argument("--tts-model", default=None,
+                        help="Override TTS model path/repo (default per backend)")
     parser.add_argument("--voice", default="casual_male",
                         help="Voxtral voice preset (casual_male, neutral_female, …)")
+    parser.add_argument("--ref-audio", default=None,
+                        help="VoxCPM: reference WAV for voice cloning")
+    parser.add_argument("--ref-text", default=None,
+                        help="VoxCPM: transcript of --ref-audio")
     args = parser.parse_args()
 
     model, processor = load_model(args.model)
@@ -87,7 +96,20 @@ def main():
     print(f"[generate] max_tokens={args.max_tokens}  temp={args.temp}\n")
     print("=" * 60)
 
-    tts = VoxtralTTSPlayer(model_path=args.tts_model, voice=args.voice) if args.tts else None
+    if args.tts:
+        if args.tts_backend == "voxcpm":
+            tts = VoxCPMTTSPlayer(
+                model_path=args.tts_model or DEFAULT_VOXCPM_MODEL,
+                ref_audio=args.ref_audio,
+                ref_text=args.ref_text,
+            )
+        else:
+            tts = VoxtralTTSPlayer(
+                model_path=args.tts_model or DEFAULT_VOXTRAL_MODEL,
+                voice=args.voice,
+            )
+    else:
+        tts = None
 
     t_gen = time.time()
     full = ""
