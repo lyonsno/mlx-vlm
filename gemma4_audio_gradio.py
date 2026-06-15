@@ -117,7 +117,7 @@ def build_demo(model_path: str, max_tokens: int, temperature: float):
     def infer(audio_tuple, user_prompt, max_tok, temp):
         yield from run_inference(audio_tuple, user_prompt, int(max_tok), float(temp))
 
-    with gr.Blocks(title="Gemma 4 Audio", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="Gemma 4 Audio") as demo:
         gr.Markdown(
             "## Gemma 4 Audio\n"
             "Record from mic, get streamed text back. "
@@ -151,7 +151,6 @@ def build_demo(model_path: str, max_tokens: int, temperature: float):
                 output_box = gr.Textbox(
                     label="Response",
                     lines=16,
-                    show_copy_button=True,
                 )
 
         submit_btn.click(
@@ -182,10 +181,12 @@ def main():
     args = parser.parse_args()
 
     demo = build_demo(args.model, args.max_tokens, args.temp)
+    import gradio as gr
     demo.launch(
         server_name=args.host,
         server_port=args.port,
         share=args.share,
+        theme=gr.themes.Soft(),
     )
 
 
