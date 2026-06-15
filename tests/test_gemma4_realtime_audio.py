@@ -1,4 +1,4 @@
-"""Tests for gemma4_realtime_audio.py — F4 from finding review.
+"""Tests for the gemma4_audio package — F4 from finding review.
 
 Fast, deterministic, no model loads, no GPU. Exercises:
   1. build_prompt roundtrip (audio token injection)
@@ -6,8 +6,6 @@ Fast, deterministic, no model loads, no GPU. Exercises:
   3. embed_audio guard (sys.exit on missing attribute)
 """
 
-import importlib
-import os
 import sys
 import types
 from unittest import mock
@@ -15,20 +13,9 @@ from unittest import mock
 import numpy as np
 import pytest
 
-# The script lives at the repo root, not inside a package.
-# Import it as a module from the filesystem.
-_SCRIPT_PATH = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "gemma4_realtime_audio.py",
-)
-_spec = importlib.util.spec_from_file_location("gemma4_realtime_audio", _SCRIPT_PATH)
-_mod = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_mod)
-
-build_prompt = _mod.build_prompt
-load_audio_file = _mod.load_audio_file
-main = _mod.main
-SAMPLE_RATE = _mod.SAMPLE_RATE
+from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
+from mlx_vlm.tools.gemma4_audio.audio import load_audio_file
+from mlx_vlm.tools.gemma4_audio.constants import SAMPLE_RATE
 
 
 # ---------------------------------------------------------------------------
@@ -109,12 +96,13 @@ class TestLoadAudioFile:
 # Test 3: embed_audio guard
 # ---------------------------------------------------------------------------
 class TestEmbedAudioGuard:
-    """Verify main() exits with code 1 and prints [ERROR] when the loaded
-    model lacks embed_audio."""
+    """Verify load_model() exits with code 1 and prints [ERROR] when the
+    loaded model lacks embed_audio."""
 
     def test_exits_on_missing_embed_audio(self, capsys):
         """Patch mlx_vlm.load to return a model without embed_audio;
         assert sys.exit(1) and [ERROR] in output."""
+        from mlx_vlm.tools.gemma4_audio.core import load_model
 
         # Model stub: has model_type but no embed_audio
         fake_model = types.SimpleNamespace(model_type="gemma4_unified")
@@ -126,20 +114,12 @@ class TestEmbedAudioGuard:
 
         with (
             mock.patch(
-                "sys.argv",
-                ["gemma4_realtime_audio.py", "--audio-file", "dummy.wav"],
-            ),
-            mock.patch(
                 "mlx_vlm.load",
                 return_value=(fake_model, fake_processor),
             ),
-            mock.patch(
-                "mlx_vlm.generate.stream_generate",
-                return_value=iter([]),
-            ),
             pytest.raises(SystemExit) as exc_info,
         ):
-            main()
+            load_model("dummy-model-path")
 
         assert exc_info.value.code == 1, f"expected exit(1), got exit({exc_info.value.code})"
         captured = capsys.readouterr()
