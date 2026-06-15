@@ -805,3 +805,187 @@ def load_vibevoice(model_id: str = "microsoft/VibeVoice-Realtime-0.5B"):
     mx.eval(model.parameters())
 
     return model, config
+
+
+# ---------------------------------------------------------------------------
+# Voice prompt conversion + generation
+# ---------------------------------------------------------------------------
+
+def convert_voice_prompt(pt_path: str) -> dict:
+    """Convert a PyTorch .pt voice prompt to MLX arrays.
+
+    Returns dict with 'lm', 'tts_lm', 'neg_lm', 'neg_tts_lm' each containing
+    'last_hidden_state' as mx.array and 'kv_cache' as list of (K, V) mx.array pairs.
+    """
+    import torch as _torch
+
+    data = _torch.load(pt_path, map_location="cpu", weights_only=False)
+    result = {}
+
+    for key in ("lm", "tts_lm", "neg_lm", "neg_tts_lm"):
+        entry = data[key]
+        hs = mx.array(entry["last_hidden_state"].float().numpy())
+
+        kv_cache = []
+        if "past_key_values" in entry and entry["past_key_values"] is not None:
+            pkv = entry["past_key_values"]
+            # DynamicCache or list of (K, V) tuples
+            if hasattr(pkv, "key_cache"):
+                for k, v in zip(pkv.key_cache, pkv.value_cache):
+                    kv_cache.append((
+                        mx.array(k.float().numpy()),
+                        mx.array(v.float().numpy()),
+                    ))
+            else:
+                for layer_kv in pkv:
+                    k, v = layer_kv[0], layer_kv[1]
+                    kv_cache.append((
+                        mx.array(k.float().numpy()),
+                        mx.array(v.float().numpy()),
+                    ))
+
+        result[key] = {"last_hidden_state": hs, "kv_cache": kv_cache}
+
+    return result
+
+
+TTS_TEXT_WINDOW_SIZE = 5
+TTS_SPEECH_WINDOW_SIZE = 6
+
+
+def generate(
+    model: VibeVoiceMLX,
+    text: str,
+    voice_prompt: dict,
+    cfg_scale: float = 1.5,
+    num_diffusion_steps: int = 5,
+    max_speech_tokens: int = 2000,
+    callback=None,
+) -> mx.array:
+    """Generate speech from text using VibeVoice MLX.
+
+    Args:
+        model: Loaded VibeVoiceMLX model.
+        text: Input text to speak.
+        voice_prompt: Converted voice prompt from convert_voice_prompt().
+        cfg_scale: Classifier-free guidance scale.
+        num_diffusion_steps: Number of diffusion denoising steps.
+        max_speech_tokens: Maximum number of speech latent tokens to generate.
+        callback: Optional fn(audio_chunk: mx.array) called per speech token.
+
+    Returns:
+        mx.array: Generated audio waveform (1D, 24kHz).
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B")
+    text_tokens = tokenizer.encode(text.strip() + "\n", add_special_tokens=False)
+    tts_text_ids = mx.array([text_tokens])
+
+    # Restore KV caches from voice prompt
+    def _restore_cache(kv_list):
+        caches = []
+        for k, v in kv_list:
+            c = KVCache()
+            c.keys = k
+            c.values = v
+            c.offset = k.shape[2]
+            caches.append(c)
+        return caches
+
+    lm_cache = _restore_cache(voice_prompt["lm"]["kv_cache"])
+    tts_lm_cache = _restore_cache(voice_prompt["tts_lm"]["kv_cache"])
+    neg_lm_cache = _restore_cache(voice_prompt["neg_lm"]["kv_cache"])
+    neg_tts_lm_cache = _restore_cache(voice_prompt["neg_tts_lm"]["kv_cache"])
+
+    # Last hidden states from prefill
+    lm_hidden = voice_prompt["lm"]["last_hidden_state"]
+    tts_lm_hidden = voice_prompt["tts_lm"]["last_hidden_state"]
+    neg_tts_lm_hidden = voice_prompt["neg_tts_lm"]["last_hidden_state"]
+
+    audio_chunks = []
+    acoustic_cache = StreamingCache()
+    text_window_idx = 0
+    total_speech_tokens = 0
+
+    while total_speech_tokens < max_speech_tokens:
+        # Get next text window
+        start = text_window_idx * TTS_TEXT_WINDOW_SIZE
+        end = start + TTS_TEXT_WINDOW_SIZE
+        cur_text = tts_text_ids[:, start:end]
+        text_window_idx += 1
+
+        if cur_text.shape[1] > 0:
+            # Forward through base LM
+            cur_embeds = model.language_model.embed_tokens(cur_text)
+            lm_hidden = model.language_model(inputs_embeds=cur_embeds, cache=lm_cache)
+            mx.eval(lm_hidden)
+
+            # Forward through TTS LM with LM hidden states spliced in
+            tts_embeds = model.tts_language_model.embed_tokens(cur_text)
+            splice_start = tts_embeds.shape[1] - lm_hidden.shape[1]
+            tts_embeds = mx.concatenate([
+                tts_embeds[:, :splice_start],
+                lm_hidden
+            ], axis=1) if splice_start > 0 else lm_hidden
+            # Add type embedding (text=1)
+            type_embed = model.tts_input_types(mx.ones(tts_embeds.shape[:2], dtype=mx.int32))
+            tts_embeds = tts_embeds + type_embed
+
+            tts_lm_hidden = model.tts_language_model(inputs_embeds=tts_embeds, cache=tts_lm_cache)
+            mx.eval(tts_lm_hidden)
+
+        # Generate speech tokens
+        finished = False
+        for speech_idx in range(TTS_SPEECH_WINDOW_SIZE):
+            pos_cond = tts_lm_hidden[:, -1:, :].reshape(1, -1)
+            neg_cond = neg_tts_lm_hidden[:, -1:, :].reshape(1, -1)
+
+            speech_latent = model.sample_speech_tokens(
+                pos_cond, neg_cond, cfg_scale=cfg_scale, num_steps=num_diffusion_steps
+            )
+
+            # Decode to audio
+            scaled = speech_latent.reshape(1, 1, -1) / model.speech_scaling_factor - model.speech_bias_factor
+            # acoustic decoder expects (B, C, T) where C=vae_dim
+            scaled_for_decode = mx.transpose(scaled, (0, 2, 1))  # (1, 64, 1)
+            audio_chunk = model.acoustic_decoder(scaled_for_decode, cache=acoustic_cache)
+            mx.eval(audio_chunk)
+
+            audio_chunks.append(audio_chunk.reshape(-1))
+            total_speech_tokens += 1
+
+            if callback:
+                callback(audio_chunk.reshape(-1))
+
+            # Feed speech embedding back into TTS LM
+            acoustic_embed = model.acoustic_connector(speech_latent.reshape(1, 1, -1))
+            type_embed_speech = model.tts_input_types(mx.zeros((1, 1), dtype=mx.int32))
+            tts_input = acoustic_embed + type_embed_speech
+
+            tts_lm_hidden = model.tts_language_model(inputs_embeds=tts_input, cache=tts_lm_cache)
+
+            # Also feed through negative TTS LM
+            neg_tts_lm_hidden = model.tts_language_model(inputs_embeds=tts_input, cache=neg_tts_lm_cache)
+            mx.eval(tts_lm_hidden, neg_tts_lm_hidden)
+
+            # Check EOS
+            eos_logit = model.eos_classifier(tts_lm_hidden[:, -1, :])
+            if mx.sigmoid(eos_logit).item() > 0.5:
+                finished = True
+                break
+
+            if total_speech_tokens >= max_speech_tokens:
+                break
+
+        if finished:
+            break
+
+        # Check if we've consumed all text
+        if text_window_idx * TTS_TEXT_WINDOW_SIZE >= tts_text_ids.shape[1] and cur_text.shape[1] == 0:
+            # No more text, continue generating speech until EOS
+            pass
+
+    if audio_chunks:
+        return mx.concatenate(audio_chunks)
+    return mx.array([])
