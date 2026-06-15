@@ -1,6 +1,21 @@
+import re
 from typing import Callable, Iterator
 
 import numpy as np
+
+# Matches complete and partial thinking blocks
+_THINKING_RE = re.compile(
+    r'<\|channel>thought\n.*?<channel\|>'   # complete block
+    r'|<\|channel>thought\n.*$'              # incomplete trailing block
+    r'|<\|channel>thought.*$'                # partial tag at end
+    r'|<\|channel>.*$',                      # very partial tag at end
+    re.DOTALL,
+)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove all <|channel>thought...<channel|> blocks from text."""
+    return _THINKING_RE.sub('', text).strip()
 
 
 def run_inference(
@@ -18,12 +33,9 @@ def run_inference(
     Yields the full accumulated string on each update (suitable for Gradio streaming).
     """
     from mlx_vlm.generate import stream_generate
-    from mlx_vlm.server.responses_state import ThinkingStreamState
 
     prompt = prompt_builder(user_prompt)
-    state = ThinkingStreamState()
-    acc = ""
-    prev_raw = ""
+    prev_clean = ""
 
     try:
         for token in stream_generate(
@@ -35,18 +47,10 @@ def run_inference(
             temperature=temperature,
             verbose=False,
         ):
-            # stream_generate yields accumulated text, not deltas.
-            # Extract the delta for ThinkingStreamState which expects incremental input.
             raw = token.text if hasattr(token, "text") else str(token)
-            delta_raw = raw[len(prev_raw):]
-            prev_raw = raw
-
-            if not delta_raw:
-                continue
-
-            delta = state.feed(delta_raw)
-            if delta.content:
-                acc += delta.content
-                yield acc
+            clean = _strip_thinking(raw)
+            if clean and clean != prev_clean:
+                prev_clean = clean
+                yield clean
     except Exception as e:
         yield f"[error] {e}"
