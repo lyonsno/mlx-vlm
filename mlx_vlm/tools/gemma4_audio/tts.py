@@ -1,41 +1,37 @@
 """Streaming TTS output interface + Voxtral backend.
 
-Architecture: StreamingTTSPlayer is the interface; VoxtralTTSPlayer is the
-concrete implementation. CLI and Gradio both import StreamingTTSPlayer and
-call play_chunk() as text tokens arrive from run_inference(), then flush() at
-the end of generation.
+Architecture: VoxtralTTSPlayer accumulates text while the LM generates, then
+synthesizes on the main thread in flush() — MLX Metal streams are thread-local
+and cannot safely be used from background threads.
 
-Voxtral backend:
-  - Model: mlx-community/Voxtral-4B-TTS-2603-mlx-bf16 (4B, 24kHz)
-  - Streaming: model.generate(stream=True, streaming_interval=1.0) yields
-    GenerationResult chunks with .audio (mx.array) and .sample_rate
-  - Playback: mlx_audio.tts.audio_player.AudioPlayer (sounddevice OutputStream)
-  - Dep: mistral-common[audio] for tekken tokenizer
+Sequence:
+    tts = VoxtralTTSPlayer()
+    for text in run_inference(...):
+        tts.play_chunk(text)   # buffers text, no-op until flush
+    tts.flush()                # synthesize on main thread + play via AudioPlayer
+    tts.close()
 
-Future candidates (add as VoxCPM2TTSPlayer, etc.):
+Future candidates:
   - VoxCPM2 (OpenBMB, 48kHz, tier-1): mlx_audio.tts.models.voxcpm already present
   - VibeVoice-Realtime (0.5B, 300ms): mlx_audio.tts.models.vibevoice present
 """
-
-import threading
-from typing import Optional
 
 import numpy as np
 
 
 class StreamingTTSPlayer:
-    """Interface for streaming TTS playback."""
+    """Interface for TTS playback after LM generation."""
 
     def __init__(self, voice: str = "casual_male", sample_rate: int = 24_000):
         self.voice = voice
         self.sample_rate = sample_rate
 
     def play_chunk(self, text: str) -> None:
-        """Synthesize text chunk and queue for playback."""
+        """Accept a text delta from the LM (buffered until flush)."""
         raise NotImplementedError
 
     def flush(self) -> None:
-        """Block until all queued audio has finished playing."""
+        """Synthesize all buffered text and block until playback finishes."""
         raise NotImplementedError
 
     def close(self) -> None:
@@ -49,24 +45,17 @@ class StreamingTTSPlayer:
 
 DEFAULT_VOXTRAL_MODEL = "mlx-community/Voxtral-4B-TTS-2603-mlx-bf16"
 
-# Minimum text length before we bother synthesizing a chunk (avoids firing
-# TTS on single punctuation tokens as they stream in from the LM).
-_MIN_CHUNK_CHARS = 40
-
 
 class VoxtralTTSPlayer(StreamingTTSPlayer):
-    """Streaming TTS via Voxtral-4B-TTS on MLX + sounddevice playback.
+    """TTS via Voxtral-4B-TTS on MLX.
 
-    Usage:
-        tts = VoxtralTTSPlayer()
-        for text_chunk in run_inference(...):
-            tts.play_chunk(text_chunk)
-        tts.flush()
-        tts.close()
+    play_chunk() accumulates text deltas. flush() runs synthesis on the
+    calling (main) thread — required because MLX Metal streams are
+    thread-local and cannot be used from background threads.
 
-    Buffering strategy: accumulate incoming text until a natural sentence
-    boundary (., !, ?) or until _MIN_CHUNK_CHARS is reached, then fire TTS
-    in a background thread so generation and playback overlap.
+    Voxtral streams audio chunks during synthesis via stream=True; each chunk
+    is fed to AudioPlayer.queue_audio() so playback begins before synthesis
+    completes.
     """
 
     def __init__(
@@ -80,15 +69,9 @@ class VoxtralTTSPlayer(StreamingTTSPlayer):
         self._model_path = model_path
         self._streaming_interval = streaming_interval
         self._temperature = temperature
-
         self._model = None
         self._player = None
         self._text_buf = ""
-        self._pending: list[threading.Thread] = []
-
-    # ------------------------------------------------------------------
-    # Lazy load
-    # ------------------------------------------------------------------
 
     def _ensure_loaded(self):
         if self._model is not None:
@@ -103,15 +86,18 @@ class VoxtralTTSPlayer(StreamingTTSPlayer):
         print(f"[tts] Voxtral loaded in {time.time()-t0:.1f}s  "
               f"(sample_rate={self._model.sample_rate})")
 
-    # ------------------------------------------------------------------
-    # Synthesis helpers
-    # ------------------------------------------------------------------
+    def play_chunk(self, text: str) -> None:
+        """Buffer text delta — synthesis happens in flush() on the main thread."""
+        self._text_buf += text
 
-    def _synthesize_and_play(self, text: str):
-        """Generate audio for *text* and queue chunks in AudioPlayer."""
-        # MLX Metal streams are thread-local — initialize GPU stream in this thread.
-        import mlx.core as mx
-        mx.set_default_device(mx.gpu)
+    def flush(self) -> None:
+        """Synthesize buffered text and wait for playback to drain."""
+        text = self._text_buf.strip()
+        self._text_buf = ""
+        if not text:
+            return
+        self._ensure_loaded()
+        print(f"[tts] Synthesizing {len(text)} chars...")
         try:
             for result in self._model.generate(
                 text=text,
@@ -126,60 +112,12 @@ class VoxtralTTSPlayer(StreamingTTSPlayer):
                     self._player.queue_audio(audio_np)
         except Exception as e:
             print(f"[tts] synthesis error: {e}")
-
-    def _flush_buf(self, text: str):
-        """Fire background synthesis thread for *text*."""
-        t = threading.Thread(target=self._synthesize_and_play, args=(text,),
-                             daemon=True)
-        t.start()
-        self._pending.append(t)
-
-    @staticmethod
-    def _split_at_boundary(text: str):
-        """Return (sentence, remainder) split at last sentence-ending punctuation."""
-        for i in range(len(text) - 1, -1, -1):
-            if text[i] in ".!?":
-                return text[: i + 1].strip(), text[i + 1 :]
-        return None, text
-
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
-
-    def play_chunk(self, text: str) -> None:
-        """Accept a text chunk (typically an LM token or small delta).
-
-        Accumulates text and fires synthesis when a sentence boundary is
-        reached or the buffer exceeds _MIN_CHUNK_CHARS.
-        """
-        self._ensure_loaded()
-        self._text_buf += text
-
-        sentence, remainder = self._split_at_boundary(self._text_buf)
-        if sentence and len(self._text_buf) >= _MIN_CHUNK_CHARS:
-            self._flush_buf(sentence)
-            self._text_buf = remainder
-        elif len(self._text_buf) >= _MIN_CHUNK_CHARS * 3:
-            # Hard cap: flush even without punctuation to keep latency low
-            self._flush_buf(self._text_buf)
-            self._text_buf = ""
-
-    def flush(self) -> None:
-        """Synthesize any remaining buffered text and wait for playback to finish."""
-        self._ensure_loaded()
-        if self._text_buf.strip():
-            self._flush_buf(self._text_buf.strip())
-            self._text_buf = ""
-        # Wait for all synthesis threads to finish queueing audio
-        for t in self._pending:
-            t.join()
-        self._pending.clear()
+            return
         # Wait for AudioPlayer to drain
-        if self._player and self._player.playing:
+        if self._player.playing:
             self._player.wait_for_drain()
 
     def close(self) -> None:
-        """Stop playback and release resources."""
         if self._player:
             try:
                 self._player.stop_stream()
