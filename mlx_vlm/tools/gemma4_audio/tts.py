@@ -13,8 +13,9 @@ background thread.
 
 Backends
 --------
-VoxtralTTSPlayer  — Voxtral-4B-TTS, 24kHz, streaming chunks (low perceived latency)
-VoxCPMTTSPlayer   — VoxCPM1.5, 44.1kHz, batch decode (higher quality, no streaming)
+VoxtralTTSPlayer   — Voxtral-4B-TTS, 24kHz, streaming chunks (low perceived latency)
+VoxCPMTTSPlayer    — VoxCPM1.5, 44.1kHz, batch decode (higher quality, no streaming)
+VibeVoiceTTSPlayer — VibeVoice-Realtime-0.5B, 24kHz, MLX native diffusion TTS
 """
 
 import numpy as np
@@ -205,3 +206,116 @@ class VoxCPMTTSPlayer(StreamingTTSPlayer):
 
     def close(self) -> None:
         self._model = None
+
+
+# ---------------------------------------------------------------------------
+# VibeVoice backend
+# ---------------------------------------------------------------------------
+
+DEFAULT_VIBEVOICE_MODEL = "microsoft/VibeVoice-Realtime-0.5B"
+DEFAULT_VIBEVOICE_VOICE = "en-Davis_man"
+
+
+class VibeVoiceTTSPlayer(StreamingTTSPlayer):
+    """TTS via VibeVoice-Realtime-0.5B on MLX.
+
+    Pure MLX diffusion TTS — no external dependencies beyond mlx.
+    Requires a voice prompt .pt file (ships with the VibeVoice repo).
+
+    play_chunk() accumulates text deltas. flush() runs the full
+    VibeVoice generation pipeline on the main thread.
+    """
+
+    def __init__(
+        self,
+        model_path: str = DEFAULT_VIBEVOICE_MODEL,
+        voice_path: str = None,
+        voice_name: str = DEFAULT_VIBEVOICE_VOICE,
+        cfg_scale: float = 1.5,
+        num_diffusion_steps: int = 5,
+    ):
+        super().__init__(voice=voice_name, sample_rate=24_000)
+        self._model_path = model_path
+        self._voice_path = voice_path
+        self._voice_name = voice_name
+        self._cfg_scale = cfg_scale
+        self._num_diffusion_steps = num_diffusion_steps
+        self._model = None
+        self._voice_prompt = None
+        self._text_buf = ""
+
+    def _ensure_loaded(self):
+        if self._model is not None:
+            return
+        import time
+        print(f"[tts] Loading VibeVoice from {self._model_path}...")
+        t0 = time.time()
+        from .vibevoice_mlx import load_vibevoice, convert_voice_prompt
+        self._model, self._config = load_vibevoice(self._model_path)
+
+        # Find voice file
+        voice_path = self._voice_path
+        if voice_path is None:
+            import os
+            # Check common locations
+            candidates = [
+                f"/private/tmp/vibevoice-ref/demo/voices/streaming_model/{self._voice_name}.pt",
+                os.path.expanduser(f"~/.cache/vibevoice/voices/{self._voice_name}.pt"),
+            ]
+            for c in candidates:
+                if os.path.exists(c):
+                    voice_path = c
+                    break
+            if voice_path is None:
+                # Try to download from HF
+                try:
+                    from huggingface_hub import hf_hub_download
+                    voice_path = hf_hub_download(
+                        "microsoft/VibeVoice-Realtime-0.5B",
+                        f"demo/voices/streaming_model/{self._voice_name}.pt",
+                    )
+                except Exception:
+                    raise FileNotFoundError(
+                        f"Voice file not found for '{self._voice_name}'. "
+                        f"Provide --voice-path or place .pt file in "
+                        f"/private/tmp/vibevoice-ref/demo/voices/streaming_model/"
+                    )
+
+        print(f"[tts] Loading voice prompt: {voice_path}")
+        self._voice_prompt = convert_voice_prompt(voice_path)
+        print(f"[tts] VibeVoice loaded in {time.time()-t0:.1f}s")
+
+    def play_chunk(self, text: str) -> None:
+        self._text_buf += text
+
+    def flush(self) -> None:
+        text = self._text_buf.strip()
+        self._text_buf = ""
+        if not text:
+            return
+        self._ensure_loaded()
+        import copy
+        print(f"[tts] Synthesizing {len(text)} chars (VibeVoice, {self._num_diffusion_steps} steps)...")
+        try:
+            from .vibevoice_mlx import generate
+            import mlx.core as mx
+            audio = generate(
+                self._model, text,
+                copy.deepcopy(self._voice_prompt),
+                cfg_scale=self._cfg_scale,
+                num_diffusion_steps=self._num_diffusion_steps,
+            )
+            mx.eval(audio)
+            audio_np = np.array(audio, dtype=np.float32)
+            if audio_np.size > 0:
+                import sounddevice as sd
+                sd.play(audio_np, samplerate=self.sample_rate)
+                sd.wait()
+        except Exception as e:
+            print(f"[tts] synthesis error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def close(self) -> None:
+        self._model = None
+        self._voice_prompt = None

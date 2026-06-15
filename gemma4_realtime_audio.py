@@ -39,8 +39,10 @@ from mlx_vlm.tools.gemma4_audio.inference import run_inference
 from mlx_vlm.tools.gemma4_audio.tts import (
     DEFAULT_VOXCPM_MODEL,
     DEFAULT_VOXTRAL_MODEL,
+    DEFAULT_VIBEVOICE_MODEL,
     VoxCPMTTSPlayer,
     VoxtralTTSPlayer,
+    VibeVoiceTTSPlayer,
 )
 
 
@@ -59,8 +61,8 @@ def main():
     parser.add_argument("--tts", action="store_true",
                         help="Speak the response via TTS")
     parser.add_argument("--tts-backend", default="voxtral",
-                        choices=["voxtral", "voxcpm"],
-                        help="TTS backend: voxtral (streaming, 24kHz) or voxcpm (batch, 44.1kHz)")
+                        choices=["voxtral", "voxcpm", "vibevoice"],
+                        help="TTS backend: voxtral (streaming, 24kHz), voxcpm (batch, 44.1kHz), or vibevoice (MLX diffusion, 24kHz)")
     parser.add_argument("--tts-model", default=None,
                         help="Override TTS model path/repo (default per backend)")
     parser.add_argument("--voice", default="casual_male",
@@ -69,6 +71,14 @@ def main():
                         help="VoxCPM: reference WAV for voice cloning")
     parser.add_argument("--ref-text", default=None,
                         help="VoxCPM: transcript of --ref-audio")
+    parser.add_argument("--voice-path", default=None,
+                        help="VibeVoice: path to voice prompt .pt file")
+    parser.add_argument("--voice-name", default="en-Davis_man",
+                        help="VibeVoice: voice preset name (en-Davis_man, en-Emma_woman, …)")
+    parser.add_argument("--diffusion-steps", type=int, default=5,
+                        help="VibeVoice: number of diffusion denoising steps (default 5)")
+    parser.add_argument("--cfg-scale", type=float, default=1.5,
+                        help="VibeVoice: classifier-free guidance scale (default 1.5)")
     args = parser.parse_args()
 
     model, processor = load_model(args.model)
@@ -97,7 +107,15 @@ def main():
     print("=" * 60)
 
     if args.tts:
-        if args.tts_backend == "voxcpm":
+        if args.tts_backend == "vibevoice":
+            tts = VibeVoiceTTSPlayer(
+                model_path=args.tts_model or DEFAULT_VIBEVOICE_MODEL,
+                voice_path=args.voice_path,
+                voice_name=args.voice_name,
+                cfg_scale=args.cfg_scale,
+                num_diffusion_steps=args.diffusion_steps,
+            )
+        elif args.tts_backend == "voxcpm":
             tts = VoxCPMTTSPlayer(
                 model_path=args.tts_model or DEFAULT_VOXCPM_MODEL,
                 ref_audio=args.ref_audio,
