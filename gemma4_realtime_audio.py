@@ -57,7 +57,12 @@ def record_mic(seconds: float, sample_rate: int = SAMPLE_RATE) -> np.ndarray:
         try:
             sd.sleep(int(seconds * 1000))
         except KeyboardInterrupt:
+            sd.stop()  # F1: flush stream buffer so last partial block is not lost
             print("\n[mic] Stopped early.")
+
+    # F2: warn on zero-audio capture instead of silently returning a silent buffer
+    if not frames:
+        print("[mic] WARNING: no audio captured, check mic permissions")
 
     audio = np.concatenate(frames) if frames else np.zeros(sample_rate, dtype=np.float32)
     print(f"[mic] {len(audio)/sample_rate:.2f}s captured")
@@ -155,7 +160,10 @@ def main():
             chunk = token.text if hasattr(token, "text") else str(token)
             print(chunk, end="", flush=True)
             full += chunk
-            n_tok += 1
+            # F3: use the accumulating generation_tokens count from the result
+            # object instead of incrementing by 1 per yield, which undercounts
+            # when diffusion or batched paths emit multi-token chunks.
+            n_tok = getattr(token, "generation_tokens", n_tok + 1)
     except KeyboardInterrupt:
         print("\n[interrupted]")
 
