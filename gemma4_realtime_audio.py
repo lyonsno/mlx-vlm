@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Gemma 4 Unified realtime audio — mic → Gemma4 → streamed text.
+Gemma 4 Unified realtime audio — mic → Gemma4 → streamed text (→ optional TTS).
 
 Model: gemma-4-12B-it (Unified architecture, encoder-free audio)
 Audio: raw waveform sliced at 640 samples/token (40ms @ 16kHz), directly projected
@@ -12,6 +12,8 @@ Usage:
     python gemma4_realtime_audio.py --seconds 8 --prompt "What did I say?"
     python gemma4_realtime_audio.py --audio-file speech.wav
     python gemma4_realtime_audio.py --model mlx-community/gemma-4-12B-it-8bit
+    python gemma4_realtime_audio.py --tts                    # speak the response
+    python gemma4_realtime_audio.py --tts --voice casual_female
 
 Press Ctrl+C during recording to stop early and generate immediately.
 """
@@ -34,6 +36,10 @@ from mlx_vlm.tools.gemma4_audio.core import load_model
 from mlx_vlm.tools.gemma4_audio.audio import load_audio_file, record_mic
 from mlx_vlm.tools.gemma4_audio.prompt import build_prompt
 from mlx_vlm.tools.gemma4_audio.inference import run_inference
+from mlx_vlm.tools.gemma4_audio.tts import (
+    DEFAULT_VOXTRAL_MODEL,
+    VoxtralTTSPlayer,
+)
 
 
 def main():
@@ -48,6 +54,12 @@ def main():
     parser.add_argument("--temp", type=float, default=DEFAULT_TEMP)
     parser.add_argument("--warmup", action="store_true",
                         help="Run a silent warmup pass to pre-compile Metal kernels")
+    parser.add_argument("--tts", action="store_true",
+                        help="Speak the response via Voxtral TTS")
+    parser.add_argument("--tts-model", default=DEFAULT_VOXTRAL_MODEL,
+                        help="Voxtral TTS model path or HF repo")
+    parser.add_argument("--voice", default="casual_male",
+                        help="Voxtral voice preset (casual_male, neutral_female, …)")
     args = parser.parse_args()
 
     model, processor = load_model(args.model)
@@ -75,6 +87,8 @@ def main():
     print(f"[generate] max_tokens={args.max_tokens}  temp={args.temp}\n")
     print("=" * 60)
 
+    tts = VoxtralTTSPlayer(model_path=args.tts_model, voice=args.voice) if args.tts else None
+
     t_gen = time.time()
     full = ""
 
@@ -84,12 +98,19 @@ def main():
             delta = text[len(full):]
             print(delta, end="", flush=True)
             full = text
+            if tts and delta:
+                tts.play_chunk(delta)
     except KeyboardInterrupt:
         print("\n[interrupted]")
 
     elapsed = time.time() - t_gen
     print(f"\n{'='*60}")
     print(f"[done] {elapsed:.2f}s")
+
+    if tts:
+        print("[tts] Flushing remaining speech...")
+        tts.flush()
+        tts.close()
 
 
 if __name__ == "__main__":
