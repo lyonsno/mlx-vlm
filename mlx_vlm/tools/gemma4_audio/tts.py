@@ -109,6 +109,9 @@ class VoxtralTTSPlayer(StreamingTTSPlayer):
 
     def _synthesize_and_play(self, text: str):
         """Generate audio for *text* and queue chunks in AudioPlayer."""
+        # MLX Metal streams are thread-local — initialize GPU stream in this thread.
+        import mlx.core as mx
+        mx.set_default_device(mx.gpu)
         try:
             for result in self._model.generate(
                 text=text,
