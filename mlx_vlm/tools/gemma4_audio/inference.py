@@ -35,6 +35,7 @@ def run_inference(
     from mlx_vlm.generate import stream_generate
 
     prompt = prompt_builder(user_prompt)
+    raw_acc = ""
     prev_clean = ""
 
     try:
@@ -47,8 +48,12 @@ def run_inference(
             temperature=temperature,
             verbose=False,
         ):
-            raw = token.text if hasattr(token, "text") else str(token)
-            clean = _strip_thinking(raw)
+            # stream_generate yields per-token deltas via .text
+            delta = token.text if hasattr(token, "text") else str(token)
+            if not delta:
+                continue
+            raw_acc += delta
+            clean = _strip_thinking(raw_acc)
             if clean and clean != prev_clean:
                 prev_clean = clean
                 yield clean
