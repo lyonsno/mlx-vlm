@@ -907,6 +907,7 @@ def generate(
     acoustic_cache = StreamingCache()
     text_window_idx = 0
     total_speech_tokens = 0
+    total_text_tokens = tts_text_ids.shape[1]
 
     while total_speech_tokens < max_speech_tokens:
         # Get next text window
@@ -914,6 +915,7 @@ def generate(
         end = start + TTS_TEXT_WINDOW_SIZE
         cur_text = tts_text_ids[:, start:end]
         text_window_idx += 1
+        all_text_consumed = (end >= total_text_tokens)
 
         if cur_text.shape[1] > 0:
             # Forward through base LM
@@ -947,7 +949,6 @@ def generate(
 
             # Decode to audio
             scaled = speech_latent.reshape(1, 1, -1) / model.speech_scaling_factor - model.speech_bias_factor
-            # acoustic decoder expects (B, C, T) where C=vae_dim
             scaled_for_decode = mx.transpose(scaled, (0, 2, 1))  # (1, 64, 1)
             audio_chunk = model.acoustic_decoder(scaled_for_decode, cache=acoustic_cache)
             mx.eval(audio_chunk)
@@ -969,11 +970,13 @@ def generate(
             neg_tts_lm_hidden = model.tts_language_model(inputs_embeds=tts_input, cache=neg_tts_lm_cache)
             mx.eval(tts_lm_hidden, neg_tts_lm_hidden)
 
-            # Check EOS
-            eos_logit = model.eos_classifier(tts_lm_hidden[:, -1, :])
-            if mx.sigmoid(eos_logit).item() > 0.5:
-                finished = True
-                break
+            # Only check EOS after all text has been fed — the model
+            # fires EOS mid-utterance if checked too early
+            if all_text_consumed:
+                eos_logit = model.eos_classifier(tts_lm_hidden[:, -1, :])
+                if mx.sigmoid(eos_logit).item() > 0.5:
+                    finished = True
+                    break
 
             if total_speech_tokens >= max_speech_tokens:
                 break
