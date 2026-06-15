@@ -23,6 +23,7 @@ def run_inference(
     prompt = prompt_builder(user_prompt)
     state = ThinkingStreamState()
     acc = ""
+    prev_raw = ""
 
     try:
         for token in stream_generate(
@@ -34,8 +35,16 @@ def run_inference(
             temperature=temperature,
             verbose=False,
         ):
-            chunk = token.text if hasattr(token, "text") else str(token)
-            delta = state.feed(chunk)
+            # stream_generate yields accumulated text, not deltas.
+            # Extract the delta for ThinkingStreamState which expects incremental input.
+            raw = token.text if hasattr(token, "text") else str(token)
+            delta_raw = raw[len(prev_raw):]
+            prev_raw = raw
+
+            if not delta_raw:
+                continue
+
+            delta = state.feed(delta_raw)
             if delta.content:
                 acc += delta.content
                 yield acc
